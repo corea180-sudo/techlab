@@ -232,6 +232,108 @@ async function cancelReservation(reservationId, reason) {
 }
 
 // ──────────────────────────────────────────
+// 예약 완료(정산) - status: app → done
+// ──────────────────────────────────────────
+async function doneReservation(reservationId, payload = {}) {
+  if (!db) return { ok: false, error: 'Firebase 미연결' };
+  try {
+    const ref  = reservationsRef().doc(String(reservationId));
+    const snap = await ref.get();
+    if (!snap.exists) return { ok: false, error: '예약 없음' };
+    const data = snap.data();
+    const update = {
+      status:     'done',
+      completedAt: admin.firestore.FieldValue.serverTimestamp()
+    };
+    if (typeof payload.finalPrice === 'number') update.finalPrice = payload.finalPrice;
+    if (typeof payload.paidAmount === 'number') update.paidAmount = payload.paidAmount;
+    if (typeof payload.usedMin === 'number')    update.usedMin    = payload.usedMin;
+    if (payload.source)                         update.completedSource = payload.source;
+    await ref.update(update);
+    return { ok: true, reservation: { ...data, ...update, id: reservationId } };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+// ──────────────────────────────────────────
+// 룸 상태 컬렉션: stores/{storeId}/rooms/{roomId}
+// ──────────────────────────────────────────
+function roomsRef() {
+  return db.collection('stores').doc(STORE_ID).collection('rooms');
+}
+
+// 룸 사용 시작 (키오스크 입장, 현장 결제)
+// body: { userName, people, source, plannedEndAt, startedAt? }
+async function startRoomSession(roomId, body = {}) {
+  if (!db) return { ok: false, error: 'Firebase 미연결' };
+  try {
+    const now = Date.now();
+    const startedAt = body.startedAt || now;
+    // plannedEndAt 없으면 기본 2시간
+    const plannedEndAt = body.plannedEndAt || (now + 2 * 60 * 60 * 1000);
+    const doc = {
+      roomId,
+      storeName:     body.storeName || '',
+      status:       'using',
+      currentSession: {
+        userName:     body.userName || '현장 고객',
+        startedAt,
+        plannedEndAt,
+        people:       body.people || 1,
+        source:       body.source || 'kiosk'
+      },
+      updatedAt:    admin.firestore.FieldValue.serverTimestamp()
+    };
+    await roomsRef().doc(roomId).set(doc, { merge: true });
+    return { ok: true, room: doc };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+// 룸 사용 종료 (정산 완료)
+async function endRoomSession(roomId) {
+  if (!db) return { ok: false, error: 'Firebase 미연결' };
+  try {
+    await roomsRef().doc(roomId).set({
+      roomId,
+      status:         'idle',
+      currentSession: null,
+      updatedAt:      admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+// 룸 예상 종료시간 업데이트 (시간 연장/단축)
+async function updateRoomSession(roomId, body = {}) {
+  if (!db) return { ok: false, error: 'Firebase 미연결' };
+  try {
+    const ref = roomsRef().doc(roomId);
+    const snap = await ref.get();
+    if (!snap.exists) return { ok: false, error: '룸 상태 없음' };
+    const data = snap.data();
+    if (!data.currentSession) return { ok: false, error: '사용중 세션 없음' };
+
+    const newSession = { ...data.currentSession };
+    if (typeof body.plannedEndAt === 'number') newSession.plannedEndAt = body.plannedEndAt;
+    if (typeof body.people === 'number') newSession.people = body.people;
+    if (body.userName) newSession.userName = body.userName;
+
+    await ref.update({
+      currentSession: newSession,
+      updatedAt:      admin.firestore.FieldValue.serverTimestamp()
+    });
+    return { ok: true, session: newSession };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+// ──────────────────────────────────────────
 // 6. Firebase Firestore 실시간 리슨
 //    앱이 예약 생성(req) → Bridge가 감지 → Admin에 전달
 // ──────────────────────────────────────────
@@ -342,6 +444,69 @@ app.post('/reservations/:id/cancel', async (req, res) => {
     }, { reservationId: req.params.id, type: 'reservation_cancelled' });
   }
   res.json(result);
+});
+
+// 예약 완료(정산) - app → done
+app.post('/reservations/:id/done', async (req, res) => {
+  const result = await doneReservation(req.params.id, req.body || {});
+  if (result.ok) {
+    broadcast({ type: 'reservation_status_changed', reservationId: req.params.id, status: 'done' }, 'admin');
+  }
+  res.json(result);
+});
+
+// ──────────────────────────────────────────
+// 룸 상태 엔드포인트
+// ──────────────────────────────────────────
+
+// 룸 사용 시작 (키오스크/Admin에서 입장 시)
+// body: { userName, people, source, plannedEndAt, storeName }
+app.post('/rooms/:roomId/start-session', async (req, res) => {
+  const result = await startRoomSession(req.params.roomId, req.body || {});
+  if (result.ok) {
+    broadcast({ type: 'room_status_changed', roomId: req.params.roomId, status: 'using' }, 'admin');
+  }
+  res.json(result);
+});
+
+// 룸 사용 종료 (정산 완료)
+app.post('/rooms/:roomId/end-session', async (req, res) => {
+  const result = await endRoomSession(req.params.roomId);
+  if (result.ok) {
+    broadcast({ type: 'room_status_changed', roomId: req.params.roomId, status: 'idle' }, 'admin');
+  }
+  res.json(result);
+});
+
+// 룸 세션 업데이트 (시간 연장/단축, 인원 변경)
+app.post('/rooms/:roomId/update-session', async (req, res) => {
+  const result = await updateRoomSession(req.params.roomId, req.body || {});
+  if (result.ok) {
+    broadcast({ type: 'room_status_changed', roomId: req.params.roomId, status: 'using' }, 'admin');
+  }
+  res.json(result);
+});
+
+// 룸 상태 조회 (전체 또는 특정 룸)
+app.get('/rooms', async (req, res) => {
+  if (!db) return res.json([]);
+  try {
+    const snap = await roomsRef().get();
+    res.json(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/rooms/:roomId', async (req, res) => {
+  if (!db) return res.status(503).json({ error: 'Firebase 미연결' });
+  try {
+    const snap = await roomsRef().doc(req.params.roomId).get();
+    if (!snap.exists) return res.status(404).json({ error: '룸 상태 없음' });
+    res.json({ id: snap.id, ...snap.data() });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // IP 일괄 설정 (Admin → Bridge → 룸 에이전트들)
