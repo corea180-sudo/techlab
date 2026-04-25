@@ -628,7 +628,58 @@ server.listen(PORT, () => {
   console.log('╚══════════════════════════════════════════╝');
   console.log('');
   startFirestoreListener();
+  startAutoCancelOverdue();  // 🔥 2026-04-25: 1시간 초과 미사용 예약 자동 취소
 });
+
+// 🔥 2026-04-25: 1시간 초과 미사용 예약 자동 취소 (노쇼 정리)
+//   - 24시간 무인영업 + 노쇼 케이스 처리
+//   - startTime이 1시간 이상 지났는데 status가 여전히 'req' 또는 'app'이면 자동 cancelled
+//   - 5분마다 체크. 시작 30초 후 1차 실행
+async function autoCancelOverdueReservations() {
+  if (!db) return;
+  try {
+    const now = Date.now();
+    const cutoff = now - 60 * 60 * 1000; // 1시간 전
+    // status in ('req','app') AND startTime < cutoff
+    const snap = await reservationsRef()
+      .where('status', 'in', ['req', 'app'])
+      .where('startTime', '<', cutoff)
+      .get();
+    if (snap.empty) return;
+    let count = 0;
+    const cancelledIds = [];
+    for (const docSnap of snap.docs) {
+      try {
+        await docSnap.ref.update({
+          status: 'cancelled',
+          cancelReason: 'auto: no-show >1h after startTime',
+          autoCancelledAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+        count++;
+        cancelledIds.push(docSnap.id);
+      } catch(e) {
+        console.warn('[자동취소 실패]', docSnap.id, e.message);
+      }
+    }
+    if (count > 0) {
+      console.log(`[자동취소] ${count}건 취소 처리 (1시간 초과 미사용): ${cancelledIds.join(', ')}`);
+      // admin들에게 broadcast (룸카드/대시보드 즉시 갱신)
+      cancelledIds.forEach(id => {
+        broadcast({ type: 'reservation_status_changed', reservationId: id, status: 'cancelled', reason: 'auto-cancel-overdue' }, 'admin');
+      });
+    }
+  } catch(e) {
+    console.warn('[자동취소 오류]', e.message);
+  }
+}
+
+function startAutoCancelOverdue() {
+  // 시작 30초 후 1차 실행 (Firebase 연결 안정화 대기)
+  setTimeout(autoCancelOverdueReservations, 30 * 1000);
+  // 이후 5분마다 반복
+  setInterval(autoCancelOverdueReservations, 5 * 60 * 1000);
+  console.log('[Auto-Cancel] ✅ 자동 취소 cron 시작 (5분 간격, 1시간 초과 미사용 예약)');
+}
 
 // 예외 처리 - 서버 죽지 않게
 process.on('uncaughtException',  e => console.error('[오류]', e.message));
