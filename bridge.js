@@ -249,6 +249,14 @@ async function doneReservation(reservationId, payload = {}) {
     if (typeof payload.paidAmount === 'number') update.paidAmount = payload.paidAmount;
     if (typeof payload.usedMin === 'number')    update.usedMin    = payload.usedMin;
     if (payload.source)                         update.completedSource = payload.source;
+    // 🔥 2026-04-25: 결제수단 정보 저장 (현금/카드 분류용)
+    if (Array.isArray(payload.payments))        update.payments     = payload.payments;
+    if (payload.paymentMethod === 'cash' || payload.paymentMethod === 'card') {
+      update.paymentMethod = payload.paymentMethod;
+      update.method        = payload.paymentMethod;  // 호환용 별칭
+    }
+    if (typeof payload.cashAmount === 'number') update.cashAmount   = payload.cashAmount;
+    if (typeof payload.cardAmount === 'number') update.cardAmount   = payload.cardAmount;
     await ref.update(update);
     return { ok: true, reservation: { ...data, ...update, id: reservationId } };
   } catch (e) {
@@ -453,6 +461,42 @@ app.post('/reservations/:id/done', async (req, res) => {
     broadcast({ type: 'reservation_status_changed', reservationId: req.params.id, status: 'done' }, 'admin');
   }
   res.json(result);
+});
+
+// 🔥 2026-04-25: 즉시 정산 (admin이 룸을 reservation 없이 직접 시작 후 정산하는 케이스)
+// 새 reservation을 'done' 상태로 생성. 결제수단 정보 함께 저장.
+app.post('/reservations/instant-done', async (req, res) => {
+  if (!db) return res.json({ ok: false, error: 'Firebase 미연결' });
+  try {
+    const p = req.body || {};
+    const id = 'inst_' + Date.now() + '_' + Math.floor(Math.random() * 1000);
+    const doc = {
+      id,
+      roomId:    p.roomId || '',
+      status:    'done',
+      finalPrice: typeof p.finalPrice === 'number' ? p.finalPrice : 0,
+      paidAmount: typeof p.paidAmount === 'number' ? p.paidAmount : 0,
+      usedMin:    typeof p.usedMin    === 'number' ? p.usedMin    : 0,
+      people:     p.people || 1,
+      userName:   p.userName || '매장 고객',
+      startTime:  p.startTime || Date.now(),
+      completedAt: admin.firestore.FieldValue.serverTimestamp(),
+      completedSource: p.source || 'pos'
+    };
+    // 결제수단 정보
+    if (Array.isArray(p.payments))               doc.payments      = p.payments;
+    if (p.paymentMethod === 'cash' || p.paymentMethod === 'card') {
+      doc.paymentMethod = p.paymentMethod;
+      doc.method        = p.paymentMethod;
+    }
+    if (typeof p.cashAmount === 'number')        doc.cashAmount    = p.cashAmount;
+    if (typeof p.cardAmount === 'number')        doc.cardAmount    = p.cardAmount;
+    await reservationsRef().doc(id).set(doc);
+    broadcast({ type: 'reservation_status_changed', reservationId: id, status: 'done' }, 'admin');
+    return res.json({ ok: true, id });
+  } catch (e) {
+    return res.json({ ok: false, error: e.message });
+  }
 });
 
 // ──────────────────────────────────────────
