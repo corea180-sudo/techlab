@@ -97,8 +97,11 @@ async function handleClientMessage(clientId, msg) {
 
     // ── 클라이언트 등록 ──
     case 'register':
-      info.type   = msg.clientType;  // 'admin' | 'kiosk' | 'room_agent'
+      info.type   = msg.clientType;
       info.roomId = msg.roomId || null;
+      info.hostname = msg.hostname || '';
+      info.ip       = msg.ip || '';
+      info.mac      = msg.mac || '';
       console.log(`[WS] #${clientId} 등록: ${info.type}${info.roomId ? ' ('+info.roomId+')' : ''}`);
       // Admin 등록 시 현재 예약 목록 즉시 전송
       if (info.type === 'admin') {
