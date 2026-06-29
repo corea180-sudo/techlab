@@ -434,6 +434,7 @@ app.get('/agents', (req, res) => {
     if (info.type === 'room_agent' && info.roomId) {
       result[info.roomId] = {
         clientId: id,
+        storeId:  info.storeId || null,
         hostname: info.hostname,
         ip:       info.ip,
         mac:      info.mac,
