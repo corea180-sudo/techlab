@@ -1,190 +1,335 @@
 /**
- * TechLab Room Agent
- * 룸 PC에 설치 - 부팅 시 자동실행, 브리지 서버에 자동 등록
- *
- * 빌드: npm install && npx pkg agent.js --targets node18-win-x64 --output techlab_agent.exe
- * 자동시작: 윈도우 시작프로그램에 등록 (설치 시 자동 처리)
+ * TechLab Room Agent v6 — roomId 자동 (현장 실사용 fix)
+ *  - v5 + roomId 자동 박음 (IP 매핑 없어도)
+ *  - hostname 기반 임시 ID로 brige에 자동 잡힘
  */
 
-const os      = require('os');
-const http    = require('http');
-const dgram   = require('dgram');
+const WebSocket = require('ws');
 
-// ── 설정 ──────────────────────────────────────────────────────────────────
-// 브리지 서버 자동 탐색 (같은 네트워크면 UDP 브로드캐스트로 찾음)
-// 못 찾으면 fallback IP 사용
-const FALLBACK_BRIDGE = '192.168.0.200'; // 키오스크/카운터 PC IP
-const BRIDGE_PORT     = 3000;
-const BROADCAST_PORT  = 3001;
-const HEARTBEAT_SEC   = 10;
+// 🔥 시작프로그램 자동 등록 (Windows 첫 실행 시)
+// (자동 시작프로그램 등록 IIFE 제거 — installer의 작업 스케줄러가 대신 시작 담당)
+// 옛날에 HKCU\Run에 자기를 박았는데, 그러면 부팅 시 콘솔창이 뜬 채로 .exe가 실행됨.
+// 작업 스케줄러는 -Hidden 옵션으로 띄우니 콘솔창 안 보임.
 
-// IP 끝자리 → 룸 번호 매핑 (201=room1 ~ 207=room7)
-// DHCP 환경이면 자동 감지로 대체됨
+
+console.log('[techlab_agent] v7 시작');
+// 🔥 부팅 시 기본 mute — 단, 카운터 PC (룸 매핑 X) 는 SKIP
+setTimeout(function(){
+  try {
+    const _https = require('https');
+    const _os = require('os');
+    const myMac = (function(){
+      const ifs = _os.networkInterfaces();
+      for(const k in ifs) for(const i of ifs[k]) if(!i.internal && i.mac && i.mac !== '00:00:00:00:00:00') return i.mac.toLowerCase();
+      return '';
+    })();
+    _https.get('https://firestore.googleapis.com/v1/projects/fore-platform/databases/(default)/documents/stores/store_001/iotConfig', function(res){
+      let body = '';
+      res.on('data', function(c){ body += c; });
+      res.on('end', function(){
+        try {
+          const data = JSON.parse(body);
+          let isRoomPc = false;
+          for(const doc of (data.documents || [])){
+            // 🔥 카운터 문서는 룸 PC 판정에서 제외 (카운터 MAC을 룸 PC로 오인 진범)
+            const docPath = doc.name || '';
+            if(docPath.endsWith('/counter')) continue;
+            const fields = doc.fields || {};
+            const mac = fields.pcMac && fields.pcMac.stringValue;
+            if(mac && mac.toLowerCase() === myMac){ isRoomPc = true; break; }
+          }
+          if(!isRoomPc){
+            console.log('[startup] 카운터 PC 감지 — 자동 mute SKIP');
+            return;
+          }
+          const { exec: _e } = require('child_process');
+          _e('powershell -NoProfile -EncodedCommand QQBkAGQALQBUAHkAcABlACAALQBUAHkAcABlAEQAZQBmAGkAbgBpAHQAaQBvAG4AIAAnAAoAdQBzAGkAbgBnACAAUwB5AHMAdABlAG0ALgBSAHUAbgB0AGkAbQBlAC4ASQBuAHQAZQByAG8AcABTAGUAcgB2AGkAYwBlAHMAOwAKAFsARwB1AGkAZAAoACIANQBDAEQARgAyAEMAOAAyAC0AOAA0ADEARQAtADQANQA0ADYALQA5ADcAMgAyAC0AMABDAEYANwA0ADAANwA4ADIAMgA5AEEAIgApACwAIABJAG4AdABlAHIAZgBhAGMAZQBUAHkAcABlACgAMQApAF0ACgBwAHUAYgBsAGkAYwAgAGkAbgB0AGUAcgBmAGEAYwBlACAASQBBAEUAVgAyACAAewAKACAAIABpAG4AdAAgAGYAMQAoACkAOwAgAGkAbgB0ACAAZgAyACgAKQA7ACAAaQBuAHQAIABmADMAKAApADsAIABpAG4AdAAgAGYANAAoACkAOwAKACAAIABpAG4AdAAgAFMAZQB0AE0AYQBzAHQAZQByAFYAbwBsAHUAbQBlAEwAZQB2AGUAbAAoAGYAbABvAGEAdAAgAHYALAAgAHIAZQBmACAAUwB5AHMAdABlAG0ALgBHAHUAaQBkACAAZwApADsACgAgACAAaQBuAHQAIABTAGUAdABNAGEAcwB0AGUAcgBWAG8AbAB1AG0AZQBMAGUAdgBlAGwAUwBjAGEAbABhAHIAKABmAGwAbwBhAHQAIAB2ACwAIAByAGUAZgAgAFMAeQBzAHQAZQBtAC4ARwB1AGkAZAAgAGcAKQA7AAoAIAAgAGkAbgB0ACAAZgA3ACgAKQA7ACAAaQBuAHQAIABmADgAKAApADsAIABpAG4AdAAgAGYAOQAoACkAOwAgAGkAbgB0ACAAZgAxADAAKAApADsAIABpAG4AdAAgAGYAMQAxACgAKQA7AAoAIAAgAGkAbgB0ACAAUwBlAHQATQB1AHQAZQAoAFsATQBhAHIAcwBoAGEAbABBAHMAKABVAG4AbQBhAG4AYQBnAGUAZABUAHkAcABlAC4AQgBvAG8AbAApAF0AYgBvAG8AbAAgAG0ALAAgAHIAZQBmACAAUwB5AHMAdABlAG0ALgBHAHUAaQBkACAAZwApADsACgAgACAAaQBuAHQAIABHAGUAdABNAHUAdABlACgAbwB1AHQAIABiAG8AbwBsACAAbQApADsACgB9AAoAWwBHAHUAaQBkACgAIgAwAEIARAA3AEEAMQBCAEUALQA3AEEAMQBBAC0ANAA0AEQAQgAtADgAMwA5ADcALQBDAEMANQAzADkAMgAzADgANwBCADUARQAiACkALAAgAEkAbgB0AGUAcgBmAGEAYwBlAFQAeQBwAGUAKAAxACkAXQAKAHAAdQBiAGwAaQBjACAAaQBuAHQAZQByAGYAYQBjAGUAIABJAE0ATQBEAEMAMgAgAHsACgAgACAAaQBuAHQAIABHAGUAdABDAG8AdQBuAHQAKABvAHUAdAAgAHUAaQBuAHQAIABjACkAOwAKACAAIABpAG4AdAAgAEkAdABlAG0AKAB1AGkAbgB0ACAAbgAsACAAbwB1AHQAIABJAE0ATQBEADIAIABkACkAOwAKAH0ACgBbAEcAdQBpAGQAKAAiAEQANgA2ADYAMAA2ADMARgAtADEANQA4ADcALQA0AEUANAAzAC0AOAAxAEYAMQAtAEIAOQA0ADgARQA4ADAANwAzADYAMwBGACIAKQAsACAASQBuAHQAZQByAGYAYQBjAGUAVAB5AHAAZQAoADEAKQBdAAoAcAB1AGIAbABpAGMAIABpAG4AdABlAHIAZgBhAGMAZQAgAEkATQBNAEQAMgAgAHsACgAgACAAaQBuAHQAIABBAGMAdABpAHYAYQB0AGUAKAByAGUAZgAgAFMAeQBzAHQAZQBtAC4ARwB1AGkAZAAgAGkAZAAsACAAaQBuAHQAIABjAHQAeAAsACAAUwB5AHMAdABlAG0ALgBJAG4AdABQAHQAcgAgAHAALAAgAFsATQBhAHIAcwBoAGEAbABBAHMAKABVAG4AbQBhAG4AYQBnAGUAZABUAHkAcABlAC4ASQBVAG4AawBuAG8AdwBuACkAXQAgAG8AdQB0ACAAbwBiAGoAZQBjAHQAIABpACkAOwAKAH0ACgBbAEcAdQBpAGQAKAAiAEEAOQA1ADYANgA0AEQAMgAtADkANgAxADQALQA0AEYAMwA1AC0AQQA3ADQANgAtAEQARQA4AEQAQgA2ADMANgAxADcARQA2ACIAKQAsACAASQBuAHQAZQByAGYAYQBjAGUAVAB5AHAAZQAoADEAKQBdAAoAcAB1AGIAbABpAGMAIABpAG4AdABlAHIAZgBhAGMAZQAgAEkATQBNAEUAMgAgAHsACgAgACAAaQBuAHQAIABFAG4AdQBtAEEAdQBkAGkAbwBFAG4AZABwAG8AaQBuAHQAcwAoAGkAbgB0ACAAZABhAHQAYQBGAGwAbwB3ACwAIABpAG4AdAAgAG0AYQBzAGsALAAgAG8AdQB0ACAASQBNAE0ARABDADIAIABjAG8AbAApADsACgAgACAAaQBuAHQAIABHAGUAdABEAGUAZgBhAHUAbAB0ACgAaQBuAHQAIABkAGEAdABhAEYAbABvAHcALAAgAGkAbgB0ACAAcgBvAGwAZQAsACAAbwB1AHQAIABJAE0ATQBEADIAIABkAGUAdgBpAGMAZQApADsACgB9AAoAWwBHAHUAaQBkACgAIgBCAEMARABFADAAMwA5ADUALQBFADUAMgBGAC0ANAA2ADcAQwAtADgARQAzAEQALQBDADQANQA3ADkAMgA5ADEANgA5ADIARQAiACkAXQAKAHAAdQBiAGwAaQBjACAAYwBsAGEAcwBzACAATQBNAEUAMgAgAHsAIAB9AAoAcAB1AGIAbABpAGMAIABjAGwAYQBzAHMAIABBAHUAMgAgAHsACgAgACAAcAB1AGIAbABpAGMAIABzAHQAYQB0AGkAYwAgAHYAbwBpAGQAIABNAHUAdABlAEEAbABsACgAYgBvAG8AbAAgAG0AdQB0AGUAKQAgAHsACgAgACAAIAAgAHYAYQByACAAZQAgAD0AIAAoAEkATQBNAEUAMgApAFMAeQBzAHQAZQBtAC4AQQBjAHQAaQB2AGEAdABvAHIALgBDAHIAZQBhAHQAZQBJAG4AcwB0AGEAbgBjAGUAKABTAHkAcwB0AGUAbQAuAFQAeQBwAGUALgBHAGUAdABUAHkAcABlAEYAcgBvAG0AQwBMAFMASQBEACgAdAB5AHAAZQBvAGYAKABNAE0ARQAyACkALgBHAFUASQBEACkAKQA7AAoAIAAgACAAIABJAE0ATQBEAEMAMgAgAGMAbwBsADsACgAgACAAIAAgAGUALgBFAG4AdQBtAEEAdQBkAGkAbwBFAG4AZABwAG8AaQBuAHQAcwAoADAALAAgADEALAAgAG8AdQB0ACAAYwBvAGwAKQA7AAoAIAAgACAAIAB1AGkAbgB0ACAAYwBuAHQAOwAgAGMAbwBsAC4ARwBlAHQAQwBvAHUAbgB0ACgAbwB1AHQAIABjAG4AdAApADsACgAgACAAIAAgAFMAeQBzAHQAZQBtAC4ARwB1AGkAZAAgAGcAIAA9ACAAUwB5AHMAdABlAG0ALgBHAHUAaQBkAC4ARQBtAHAAdAB5ADsACgAgACAAIAAgAGYAbwByACAAKAB1AGkAbgB0ACAAaQAgAD0AIAAwADsAIABpACAAPAAgAGMAbgB0ADsAIABpACsAKwApACAAewAKACAAIAAgACAAIAAgAEkATQBNAEQAMgAgAGQAOwAgAGMAbwBsAC4ASQB0AGUAbQAoAGkALAAgAG8AdQB0ACAAZAApADsACgAgACAAIAAgACAAIAB2AGEAcgAgAGkAaQBkACAAPQAgAHQAeQBwAGUAbwBmACgASQBBAEUAVgAyACkALgBHAFUASQBEADsAIABvAGIAagBlAGMAdAAgAG8AOwAKACAAIAAgACAAIAAgAGQALgBBAGMAdABpAHYAYQB0AGUAKAByAGUAZgAgAGkAaQBkACwAIAAxACwAIABTAHkAcwB0AGUAbQAuAEkAbgB0AFAAdAByAC4AWgBlAHIAbwAsACAAbwB1AHQAIABvACkAOwAKACAAIAAgACAAIAAgACgAKABJAEEARQBWADIAKQBvACkALgBTAGUAdABNAHUAdABlACgAbQB1AHQAZQAsACAAcgBlAGYAIABnACkAOwAKACAAIAAgACAAfQAKACAAIAB9AAoAfQAKACcAIAAtAEUAcgByAG8AcgBBAGMAdABpAG8AbgAgAFMAaQBsAGUAbgB0AGwAeQBDAG8AbgB0AGkAbgB1AGUAOwBbAEEAdQAyAF0AOgA6AE0AdQB0AGUAQQBsAGwAKAAkAHQAcgB1AGUAKQA=', { windowsHide: true }, function(){});
+          console.log('[startup] 룸 PC — 부팅 시 자동 mute 발사');
+        } catch(e){ console.warn('[startup] 체크 실패:', e.message); }
+      });
+    }).on('error', function(e){ console.warn('[startup] Firestore fetch 실패:', e.message); });
+  } catch(e){}
+}, 5000);
+
+
+// 🔥 잠금 오버레이 — PowerShell WPF 풀스크린 윈도우 (멀티모니터: 메인+프로젝터+세컨드 다 가림)
+// 근본 단순화 (2026-04-30):
+//  - PS1 파일을 tmpdir에 작성 (escape 함정 회피)
+//  - VBS launcher 제거 (path double-escape 진범)
+//  - powershell.exe -File <path> 를 spawn으로 직접 실행 (args가 string이 아니라 array → escape 함정 0)
+const _fs = require('fs');
+const _path = require('path');
+const _os = require('os');
+const { spawn } = require('child_process');
+
+const LOCK_PS1_PATH = _path.join(_os.tmpdir(), 'techlab_lock.ps1');
+const LOCK_PS1_TEST_PATH = _path.join(_os.tmpdir(), 'techlab_lock_test.ps1');
+
+// 들여쓰기 없는 단일 라인 모음 — here-string 함정 회피
+const LOCK_PS_LINES = [
+  "Add-Type -AssemblyName PresentationFramework",
+  "Add-Type -AssemblyName PresentationCore",
+  "Add-Type -AssemblyName WindowsBase",
+  "Add-Type -AssemblyName System.Windows.Forms",
+  "$pid_ = [System.Diagnostics.Process]::GetCurrentProcess().Id",
+  "$screens = [System.Windows.Forms.Screen]::AllScreens",
+  "$wins = New-Object System.Collections.ArrayList",
+  "$wid = 0",
+  "foreach ($scr in $screens) {",
+  "  $b = $scr.Bounds",
+  "  $isP = $scr.Primary",
+  "  $title = 'TechLabLock_' + $pid_ + '_' + $wid",
+  "  $body = \"<StackPanel HorizontalAlignment='Center' VerticalAlignment='Center'><TextBlock Text='FORE' FontSize='80' FontWeight='Bold' Foreground='#d4a85e' HorizontalAlignment='Center' Margin='0,0,0,4'/><TextBlock Text='TECHLAB' FontSize='14' Foreground='#888' HorizontalAlignment='Center' Margin='0,0,0,20'/><TextBlock Name='LockIcon' Text='&#x1F512;' FontSize='100' Foreground='#d4a85e' HorizontalAlignment='Center' Margin='0,0,0,20' Opacity='1'><TextBlock.Effect><DropShadowEffect Color='#d4a85e' BlurRadius='60' ShadowDepth='0' Opacity='1.0'/></TextBlock.Effect><TextBlock.Triggers><EventTrigger RoutedEvent='TextBlock.Loaded'><BeginStoryboard><Storyboard RepeatBehavior='Forever' AutoReverse='True'><DoubleAnimation Storyboard.TargetProperty='Opacity' From='1.0' To='0.4' Duration='0:0:1.0'/></Storyboard></BeginStoryboard></EventTrigger></TextBlock.Triggers></TextBlock><TextBlock Text='사용 시간이 종료되었습니다' FontSize='28' FontWeight='Bold' Foreground='White' HorizontalAlignment='Center' Margin='0,0,0,12'/><TextBlock Text='계속 이용하시려면 추가결제 해주세요.' FontSize='16' Foreground='#ccc' HorizontalAlignment='Center' Margin='0,0,0,30'/></StackPanel>\"",
+  "  $xamlStr = \"<Window xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Title='\" + $title + \"' WindowStyle='None' ResizeMode='NoResize' Topmost='True' ShowInTaskbar='False' Cursor='None' Background='Black'><Grid>\" + $body + \"</Grid></Window>\"",
+  "  [xml]$xaml = $xamlStr",
+  "  $reader = New-Object System.Xml.XmlNodeReader $xaml",
+  "  $w = [Windows.Markup.XamlReader]::Load($reader)",
+  "  $w.Add_PreviewKeyDown({ param($s,$e) $e.Handled = $true })",
+  "  $w.Add_KeyDown({ param($s,$e) $e.Handled = $true })",
+  "  $w.Add_Closing({ param($s,$e) $e.Cancel = $true })",
+  "  $w.WindowStartupLocation = 'Manual'",
+  "  $w.Left = $b.X",
+  "  $w.Top = $b.Y",
+  "  $w.Width = $b.Width",
+  "  $w.Height = $b.Height",
+  "  [void]$wins.Add($w)",
+  "  $wid++",
+  "}",
+  "$timer = New-Object System.Windows.Threading.DispatcherTimer",
+  "$timer.Interval = [TimeSpan]::FromMilliseconds(1000)",
+  "$timer.Add_Tick({ foreach ($w in $wins) { try { $w.Topmost = $false; $w.Topmost = $true; $w.Activate() } catch {} } })",
+  "$timer.Start()",
+  "for ($i = 0; $i -lt $wins.Count - 1; $i++) { $wins[$i].Show() }",
+  "if ($wins.Count -gt 0) { [void]$wins[$wins.Count - 1].ShowDialog() }"
+];
+const LOCK_PS_CONTENT = LOCK_PS_LINES.join("\r\n");
+
+// 테스트용 PS1 — 키차단 X + Esc 핸들러 박힘. 콘텐츠는 실전과 동일 (메인/세컨드 모두 풀 안내문).
+const LOCK_PS_TEST_CONTENT = LOCK_PS_CONTENT
+  .replace("$w.Add_PreviewKeyDown({ param($s,$e) $e.Handled = $true })", "$w.Add_PreviewKeyDown({ param($s,$e) if ($e.Key -eq 'Escape') { foreach ($x in $wins) { try { $x.Close() } catch {} } } })")
+  .replace("$w.Add_KeyDown({ param($s,$e) $e.Handled = $true })", "$w.Add_KeyDown({ param($s,$e) if ($e.Key -eq 'Escape') { foreach ($x in $wins) { try { $x.Close() } catch {} } } })")
+  .replace("$w.Add_Closing({ param($s,$e) $e.Cancel = $true })", "");
+
+try {
+  // BOM 박아서 한글(UTF-8) 안전하게 PowerShell이 읽음
+  _fs.writeFileSync(LOCK_PS1_PATH, '\uFEFF' + LOCK_PS_CONTENT, { encoding: 'utf-8' });
+  _fs.writeFileSync(LOCK_PS1_TEST_PATH, '\uFEFF' + LOCK_PS_TEST_CONTENT, { encoding: 'utf-8' });
+  console.log('[lock_ps1] 잠금 PowerShell 스크립트 생성:', LOCK_PS1_PATH, '(' + LOCK_PS_CONTENT.length + ' chars)');
+  console.log('[lock_ps1_test] 테스트용 PS1 (Esc로 풀림):', LOCK_PS1_TEST_PATH);
+} catch(e){ console.warn('[lock_ps1] 작성 실패:', e.message); }
+
+
+
+
+
+const os    = require('os');
+const dgram = require('dgram');
+const { exec } = require('child_process');
+
+const BRIDGE_WS = process.env.BRIDGE_WS || 'wss://fore-bridge.onrender.com';
+const ROOM_ID_ENV = process.env.ROOM_ID || null;
+const ROLE      = process.env.AGENT_ROLE || 'room_agent';
+const RECONNECT_SEC = 5;
+const HEARTBEAT_SEC = 30;
+const WOL_PORT  = 9;
+
 const IP_TO_ROOM = {
   201: 'room1', 202: 'room2', 203: 'room3', 204: 'room4',
   205: 'room5', 206: 'room6', 207: 'room7'
 };
 
-// ── 내 네트워크 정보 가져오기 ──────────────────────────────────────────────
 function getMyInfo() {
   const ifaces = os.networkInterfaces();
   for (const name of Object.keys(ifaces)) {
     for (const iface of ifaces[name]) {
       if (iface.family === 'IPv4' && !iface.internal) {
-        return { ip: iface.address, mac: iface.mac, hostname: os.hostname() };
+        return { ip: iface.address, mac: iface.mac, hostname: os.hostname(), ifaceName: name };
       }
     }
   }
-  return { ip: '0.0.0.0', mac: '00:00:00:00:00:00', hostname: os.hostname() };
+  return { ip: '0.0.0.0', mac: '00:00:00:00:00:00', hostname: os.hostname(), ifaceName: 'unknown' };
 }
 
-// IP 끝자리로 룸 번호 추측
 function guessRoomId(ip) {
   const last = parseInt(ip.split('.').pop());
   return IP_TO_ROOM[last] || null;
 }
 
-// ── UDP 브로드캐스트로 브리지 서버 자동 탐색 ──────────────────────────────
-let bridgeIp = FALLBACK_BRIDGE;
+// 🔥 v6: roomId 자동 결정 — null이면 hostname 기반 임시 ID
+function determineRoomId(myInfo) {
+  if (ROOM_ID_ENV) return ROOM_ID_ENV;  // 환경변수 우선
+  const guessed = guessRoomId(myInfo.ip);
+  if (guessed) return guessed;
+  // IP 매핑 없으면 hostname 기반 임시 ID (brige에 잡히도록)
+  const safeHost = myInfo.hostname.toLowerCase().replace(/[^a-z0-9]/g, '');
+  return 'pc_' + safeHost.slice(0, 16);
+}
 
-function discoverBridge() {
-  return new Promise(resolve => {
+function sendWoL(targetMac, broadcastAddr = '255.255.255.255') {
+  return new Promise((resolve, reject) => {
+    const macClean = targetMac.replace(/[:\-]/g, '').toLowerCase();
+    if (macClean.length !== 12) return reject(new Error('잘못된 MAC: ' + targetMac));
+    const macBytes = Buffer.from(macClean, 'hex');
+    const packet = Buffer.alloc(6 + 16 * 6);
+    packet.fill(0xff, 0, 6);
+    for (let i = 0; i < 16; i++) macBytes.copy(packet, 6 + i * 6);
     const sock = dgram.createSocket('udp4');
-    let found = false;
-
-    sock.on('message', (msg, rinfo) => {
-      try {
-        const data = JSON.parse(msg.toString());
-        if (data.type === 'techlab_bridge') {
-          console.log('[탐색] 브리지 서버 발견:', rinfo.address);
-          bridgeIp = rinfo.address;
-          found = true;
-          sock.close();
-          resolve(rinfo.address);
-        }
-      } catch(e) {}
-    });
-
     sock.bind(() => {
       sock.setBroadcast(true);
-      // 브리지 서버 탐색 요청 브로드캐스트
-      const msg = Buffer.from(JSON.stringify({ type: 'find_bridge' }));
-      sock.send(msg, 0, msg.length, BROADCAST_PORT, '255.255.255.255');
-      console.log('[탐색] 브리지 서버 탐색 중...');
-    });
-
-    // 3초 안에 못 찾으면 fallback
-    setTimeout(() => {
-      if (!found) {
-        console.log('[탐색] 탐색 실패, fallback 사용:', FALLBACK_BRIDGE);
-        try { sock.close(); } catch(e) {}
-        resolve(FALLBACK_BRIDGE);
-      }
-    }, 3000);
-  });
-}
-
-// ── 브리지 서버에 등록 요청 ───────────────────────────────────────────────
-function registerToServer(info, roomId) {
-  const body = JSON.stringify({
-    ip:       info.ip,
-    mac:      info.mac,
-    hostname: info.hostname,
-    roomId:   roomId,       // null이면 서버가 자동 배정
-    agentVersion: '1.0'
-  });
-
-  const options = {
-    hostname: bridgeIp,
-    port:     BRIDGE_PORT,
-    path:     '/agent/register',
-    method:   'POST',
-    headers:  { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
-  };
-
-  return new Promise((resolve, reject) => {
-    const req = http.request(options, res => {
-      let data = '';
-      res.on('data', d => data += d);
-      res.on('end', () => {
-        try {
-          const result = JSON.parse(data);
-          console.log(`[등록] 완료 → ${result.roomId} (${result.roomName})`);
-          resolve(result);
-        } catch(e) { reject(e); }
+      sock.send(packet, 0, packet.length, WOL_PORT, broadcastAddr, (err) => {
+        sock.close();
+        if (err) reject(err);
+        else { console.log(`[WoL] OK -> ${targetMac}`); resolve(true); }
       });
     });
-    req.on('error', reject);
-    req.write(body);
-    req.end();
   });
 }
 
-// ── 명령 수신 서버 (브리지 → 에이전트) ──────────────────────────────────
-function startCommandServer() {
-  const server = http.createServer((req, res) => {
-    if (req.method !== 'POST') return res.end('{}');
-    let body = '';
-    req.on('data', d => body += d);
-    req.on('end', () => {
-      try {
-        const cmd = JSON.parse(body);
-        console.log('[명령] 수신:', cmd);
-        handleCommand(cmd);
-        res.end(JSON.stringify({ ok: true }));
-      } catch(e) { res.end(JSON.stringify({ ok: false })); }
+function playBeep(count = 1) {
+  return new Promise(resolve => {
+    const beepCmd = Array(count).fill('[console]::beep(1000,500); Start-Sleep -m 200;').join(' ');
+    exec(`powershell -command "${beepCmd}"`, (err) => {
+      if (!err) console.log(`[Beep] OK ${count}x`);
+      resolve(true);
     });
   });
-
-  server.listen(3002, () => console.log('[에이전트] 명령 수신 대기: port 3002'));
 }
 
-function handleCommand(cmd) {
-  if (cmd.action === 'wakeup') {
-    console.log('[명령] 화면 활성화 / 슬립 해제');
-    // 실제 구현 시: child_process로 powercfg, nircmd 등 호출
-    // require('child_process').exec('powershell -command "$h = Add-Type ...wake screen..."');
-  }
-  if (cmd.action === 'shutdown') {
-    console.log('[명령] 종료');
-  }
-  if (cmd.action === 'ping') {
-    console.log('[명령] ping - 응답함');
-  }
-}
-
-// ── 하트비트 (주기적으로 생존 신호) ─────────────────────────────────────
-function startHeartbeat(info, roomId) {
-  setInterval(() => {
-    registerToServer(info, roomId).catch(e => {
-      console.warn('[하트비트] 실패, 재탐색...');
-      discoverBridge().then(() => registerToServer(info, roomId).catch(() => {}));
+function setStaticIp(targetIp, subnet, gateway, dns) {
+  return new Promise(resolve => {
+    const myInfo = getMyInfo();
+    const cmd = `powershell -command "& {netsh interface ip set address name='${myInfo.ifaceName}' static ${targetIp} ${subnet} ${gateway}; netsh interface ip set dns name='${myInfo.ifaceName}' static ${dns}}"`;
+    console.log(`[StaticIP] ${myInfo.ifaceName} -> ${targetIp}`);
+    exec(cmd, (err) => {
+      resolve(err ? { ok: false, error: err.message } : { ok: true, newIp: targetIp });
     });
-  }, HEARTBEAT_SEC * 1000);
+  });
 }
 
-// ── 메인 ─────────────────────────────────────────────────────────────────
+async function handleCommand(msg) {
+  const cmd = msg;
+  if (cmd.action === 'beep' || cmd.type === 'beep') return await playBeep(cmd.count || 1);
+  if ((cmd.action === 'wol' || cmd.type === 'wol') && cmd.targetMac) return await sendWoL(cmd.targetMac, cmd.broadcastAddr);
+  if ((cmd.action === 'set_static_ip' || cmd.type === 'set_static_ip') && cmd.ip) return await setStaticIp(cmd.ip, cmd.subnet || '255.255.255.0', cmd.gateway || '', cmd.dns || '8.8.8.8');
+  if (cmd.action === 'wakeup' || cmd.type === 'wakeup') return new Promise(r => exec('powershell -command "$wsh = New-Object -ComObject WScript.Shell; $wsh.SendKeys(\'{F15}\')"', () => r('screen on')));
+  if (cmd.action === 'lock') {
+        try {
+          // 근본 단순화 (2026-05-01): 음소거랑 100% 동일 패턴
+          // audio_mute가 작동 확인됨 → exec + windowsHide:true는 콘솔창 안 뜸
+          // PowerShell -File로 PS1 실행 → WPF 윈도우 띄움
+          const _ps1Path = cmd.test ? LOCK_PS1_TEST_PATH : LOCK_PS1_PATH;
+          const _lockCmd = 'powershell -NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File "' + _ps1Path + '"';
+          exec(_lockCmd, { windowsHide: true }, function(err, stdout, stderr){
+            if(err) console.warn('[lock] exec 실패:', err.message);
+            if(stderr) console.warn('[lock] PS stderr:', stderr.slice(0, 500));
+          });
+          console.log('[lock] 잠금 발사 (file=' + _ps1Path + ', test=' + (cmd.test?'YES':'NO') + ')');
+          // 음소거
+          exec('powershell -NoProfile -EncodedCommand QQBkAGQALQBUAHkAcABlACAALQBUAHkAcABlAEQAZQBmAGkAbgBpAHQAaQBvAG4AIAAnAAoAdQBzAGkAbgBnACAAUwB5AHMAdABlAG0ALgBSAHUAbgB0AGkAbQBlAC4ASQBuAHQAZQByAG8AcABTAGUAcgB2AGkAYwBlAHMAOwAKAFsARwB1AGkAZAAoACIANQBDAEQARgAyAEMAOAAyAC0AOAA0ADEARQAtADQANQA0ADYALQA5ADcAMgAyAC0AMABDAEYANwA0ADAANwA4ADIAMgA5AEEAIgApACwAIABJAG4AdABlAHIAZgBhAGMAZQBUAHkAcABlACgAMQApAF0ACgBwAHUAYgBsAGkAYwAgAGkAbgB0AGUAcgBmAGEAYwBlACAASQBBAEUAVgAyACAAewAKACAAIABpAG4AdAAgAGYAMQAoACkAOwAgAGkAbgB0ACAAZgAyACgAKQA7ACAAaQBuAHQAIABmADMAKAApADsAIABpAG4AdAAgAGYANAAoACkAOwAKACAAIABpAG4AdAAgAFMAZQB0AE0AYQBzAHQAZQByAFYAbwBsAHUAbQBlAEwAZQB2AGUAbAAoAGYAbABvAGEAdAAgAHYALAAgAHIAZQBmACAAUwB5AHMAdABlAG0ALgBHAHUAaQBkACAAZwApADsACgAgACAAaQBuAHQAIABTAGUAdABNAGEAcwB0AGUAcgBWAG8AbAB1AG0AZQBMAGUAdgBlAGwAUwBjAGEAbABhAHIAKABmAGwAbwBhAHQAIAB2ACwAIAByAGUAZgAgAFMAeQBzAHQAZQBtAC4ARwB1AGkAZAAgAGcAKQA7AAoAIAAgAGkAbgB0ACAAZgA3ACgAKQA7ACAAaQBuAHQAIABmADgAKAApADsAIABpAG4AdAAgAGYAOQAoACkAOwAgAGkAbgB0ACAAZgAxADAAKAApADsAIABpAG4AdAAgAGYAMQAxACgAKQA7AAoAIAAgAGkAbgB0ACAAUwBlAHQATQB1AHQAZQAoAFsATQBhAHIAcwBoAGEAbABBAHMAKABVAG4AbQBhAG4AYQBnAGUAZABUAHkAcABlAC4AQgBvAG8AbAApAF0AYgBvAG8AbAAgAG0ALAAgAHIAZQBmACAAUwB5AHMAdABlAG0ALgBHAHUAaQBkACAAZwApADsACgAgACAAaQBuAHQAIABHAGUAdABNAHUAdABlACgAbwB1AHQAIABiAG8AbwBsACAAbQApADsACgB9AAoAWwBHAHUAaQBkACgAIgAwAEIARAA3AEEAMQBCAEUALQA3AEEAMQBBAC0ANAA0AEQAQgAtADgAMwA5ADcALQBDAEMANQAzADkAMgAzADgANwBCADUARQAiACkALAAgAEkAbgB0AGUAcgBmAGEAYwBlAFQAeQBwAGUAKAAxACkAXQAKAHAAdQBiAGwAaQBjACAAaQBuAHQAZQByAGYAYQBjAGUAIABJAE0ATQBEAEMAMgAgAHsACgAgACAAaQBuAHQAIABHAGUAdABDAG8AdQBuAHQAKABvAHUAdAAgAHUAaQBuAHQAIABjACkAOwAKACAAIABpAG4AdAAgAEkAdABlAG0AKAB1AGkAbgB0ACAAbgAsACAAbwB1AHQAIABJAE0ATQBEADIAIABkACkAOwAKAH0ACgBbAEcAdQBpAGQAKAAiAEQANgA2ADYAMAA2ADMARgAtADEANQA4ADcALQA0AEUANAAzAC0AOAAxAEYAMQAtAEIAOQA0ADgARQA4ADAANwAzADYAMwBGACIAKQAsACAASQBuAHQAZQByAGYAYQBjAGUAVAB5AHAAZQAoADEAKQBdAAoAcAB1AGIAbABpAGMAIABpAG4AdABlAHIAZgBhAGMAZQAgAEkATQBNAEQAMgAgAHsACgAgACAAaQBuAHQAIABBAGMAdABpAHYAYQB0AGUAKAByAGUAZgAgAFMAeQBzAHQAZQBtAC4ARwB1AGkAZAAgAGkAZAAsACAAaQBuAHQAIABjAHQAeAAsACAAUwB5AHMAdABlAG0ALgBJAG4AdABQAHQAcgAgAHAALAAgAFsATQBhAHIAcwBoAGEAbABBAHMAKABVAG4AbQBhAG4AYQBnAGUAZABUAHkAcABlAC4ASQBVAG4AawBuAG8AdwBuACkAXQAgAG8AdQB0ACAAbwBiAGoAZQBjAHQAIABpACkAOwAKAH0ACgBbAEcAdQBpAGQAKAAiAEEAOQA1ADYANgA0AEQAMgAtADkANgAxADQALQA0AEYAMwA1AC0AQQA3ADQANgAtAEQARQA4AEQAQgA2ADMANgAxADcARQA2ACIAKQAsACAASQBuAHQAZQByAGYAYQBjAGUAVAB5AHAAZQAoADEAKQBdAAoAcAB1AGIAbABpAGMAIABpAG4AdABlAHIAZgBhAGMAZQAgAEkATQBNAEUAMgAgAHsACgAgACAAaQBuAHQAIABFAG4AdQBtAEEAdQBkAGkAbwBFAG4AZABwAG8AaQBuAHQAcwAoAGkAbgB0ACAAZABhAHQAYQBGAGwAbwB3ACwAIABpAG4AdAAgAG0AYQBzAGsALAAgAG8AdQB0ACAASQBNAE0ARABDADIAIABjAG8AbAApADsACgAgACAAaQBuAHQAIABHAGUAdABEAGUAZgBhAHUAbAB0ACgAaQBuAHQAIABkAGEAdABhAEYAbABvAHcALAAgAGkAbgB0ACAAcgBvAGwAZQAsACAAbwB1AHQAIABJAE0ATQBEADIAIABkAGUAdgBpAGMAZQApADsACgB9AAoAWwBHAHUAaQBkACgAIgBCAEMARABFADAAMwA5ADUALQBFADUAMgBGAC0ANAA2ADcAQwAtADgARQAzAEQALQBDADQANQA3ADkAMgA5ADEANgA5ADIARQAiACkAXQAKAHAAdQBiAGwAaQBjACAAYwBsAGEAcwBzACAATQBNAEUAMgAgAHsAIAB9AAoAcAB1AGIAbABpAGMAIABjAGwAYQBzAHMAIABBAHUAMgAgAHsACgAgACAAcAB1AGIAbABpAGMAIABzAHQAYQB0AGkAYwAgAHYAbwBpAGQAIABNAHUAdABlAEEAbABsACgAYgBvAG8AbAAgAG0AdQB0AGUAKQAgAHsACgAgACAAIAAgAHYAYQByACAAZQAgAD0AIAAoAEkATQBNAEUAMgApAFMAeQBzAHQAZQBtAC4AQQBjAHQAaQB2AGEAdABvAHIALgBDAHIAZQBhAHQAZQBJAG4AcwB0AGEAbgBjAGUAKABTAHkAcwB0AGUAbQAuAFQAeQBwAGUALgBHAGUAdABUAHkAcABlAEYAcgBvAG0AQwBMAFMASQBEACgAdAB5AHAAZQBvAGYAKABNAE0ARQAyACkALgBHAFUASQBEACkAKQA7AAoAIAAgACAAIABJAE0ATQBEAEMAMgAgAGMAbwBsADsACgAgACAAIAAgAGUALgBFAG4AdQBtAEEAdQBkAGkAbwBFAG4AZABwAG8AaQBuAHQAcwAoADAALAAgADEALAAgAG8AdQB0ACAAYwBvAGwAKQA7AAoAIAAgACAAIAB1AGkAbgB0ACAAYwBuAHQAOwAgAGMAbwBsAC4ARwBlAHQAQwBvAHUAbgB0ACgAbwB1AHQAIABjAG4AdAApADsACgAgACAAIAAgAFMAeQBzAHQAZQBtAC4ARwB1AGkAZAAgAGcAIAA9ACAAUwB5AHMAdABlAG0ALgBHAHUAaQBkAC4ARQBtAHAAdAB5ADsACgAgACAAIAAgAGYAbwByACAAKAB1AGkAbgB0ACAAaQAgAD0AIAAwADsAIABpACAAPAAgAGMAbgB0ADsAIABpACsAKwApACAAewAKACAAIAAgACAAIAAgAEkATQBNAEQAMgAgAGQAOwAgAGMAbwBsAC4ASQB0AGUAbQAoAGkALAAgAG8AdQB0ACAAZAApADsACgAgACAAIAAgACAAIAB2AGEAcgAgAGkAaQBkACAAPQAgAHQAeQBwAGUAbwBmACgASQBBAEUAVgAyACkALgBHAFUASQBEACkAKQA7AAoAIAAgACAAIABJAE0ATQBEAEMAMgAgAGMAbwBsADsACgAgACAAIAAgAGUALgBFAG4AdQBtAEEAdQBkAGkAbwBFAG4AZABwAG8AaQBuAHQAcwAoADAALAAgADEALAAgAG8AdQB0ACAAYwBvAGwAKQA7AAoAIAAgACAAIAB1AGkAbgB0ACAAYwBuAHQAOwAgAGMAbwBsAC4ARwBlAHQAQwBvAHUAbgB0ACgAbwB1AHQAIABjAG4AdAApADsACgAgACAAIAAgAFMAeQBzAHQAZQBtAC4ARwB1AGkAZAAgAGcAIAA9ACAAUwB5AHMAdABlAG0ALgBHAHUAaQBkAC4ARQBtAHAAdAB5ADsACgAgACAAIAAgAGYAbwByACAAKAB1AGkAbgB0ACAAaQAgAD0AIAAwADsAIABpACAAPAAgAGMAbgB0ADsAIABpACsAKwApACAAewAKACAAIAAgACAAIAAgAEkATQBNAEQAMgAgAGQAOwAgAGMAbwBsAC4ASQB0AGUAbQAoAGkALAAgAG8AdQB0ACAAZAApADsACgAgACAAIAAgACAAIAB2AGEAcgAgAGkAaQBkACAAPQAgAHQAeQBwAGUAbwBmACgASQBBAEUAVgAyACkALgBHAFUASQBEADsAIABvAGIAagBlAGMAdAAgAG8AOwAKACAAIAAgACAAIAAgAGQALgBBAGMAdABpAHYAYQB0AGUAKAByAGUAZgAgAGkAaQBkACwAIAAxACwAIABTAHkAcwB0AGUAbQAuAEkAbgB0AFAAdAByAC4AWgBlAHIAbwAsACAAbwB1AHQAIABvACkAOwAKACAAIAAgACAAIAAgACgAKABJAEEARQBWADIAKQBvACkALgBTAGUAdABNAHUAdABlACgAbQB1AHQAZQAsACAAcgBlAGYAIABnACkAOwAKACAAIAAgACAAfQAKACAAIAB9AAoAfQAKACcAIAAtAEUAcgByAG8AcgBBAGMAdABpAG8AbgAgAFMAaQBsAGUAbgB0AGwAeQBDAG8AbgB0AGkAbgB1AGUAOwBbAEEAdQAyAF0AOgA6AE0AdQB0AGUAQQBsAGwAKAAkAHQAcgB1AGUAKQA=', { windowsHide: true }, function(){});
+          console.log('[lock] WPF 풀스크린 잠금 + 음소거 발사');
+        } catch(e){ console.warn('[lock] 실패:', e.message); }
+        return;
+      }
+      if (cmd.action === 'unlock') {
+        try {
+          // 진범 fix (2026-05-01): MainWindowTitle 매칭 실패 → taskkill WINDOWTITLE 매칭으로 변경
+          // 1) WPF 윈도우 Title 직접 매칭 (TechLabLock_*) — taskkill이 자식 윈도우 Title도 검색
+          exec('taskkill /F /FI "WINDOWTITLE eq TechLabLock_*"', { windowsHide: true }, function(){});
+          // 2) 안전망: PS1 path로 commandline 매칭 (techlab_lock.ps1 / techlab_lock_test.ps1 둘 다 매칭)
+          //    PowerShell 안에서는 작은따옴표(') 사용 → cmd 큰따옴표(")와 충돌 0
+          exec('powershell -NoProfile -Command "Get-CimInstance Win32_Process | ? { $_.CommandLine -and $_.CommandLine.Contains(\'techlab_lock\') -and $_.CommandLine.Contains(\'.ps1\') } | % { Stop-Process -Id $_.ProcessId -Force -EA 0 }"', { windowsHide: true }, function(){});
+          // 3) 옛 mshta 잔재 청소
+          exec('taskkill /F /IM mshta.exe', { windowsHide: true }, function(){});
+          exec('powershell -NoProfile -EncodedCommand QQBkAGQALQBUAHkAcABlACAALQBUAHkAcABlAEQAZQBmAGkAbgBpAHQAaQBvAG4AIAAnAAoAdQBzAGkAbgBnACAAUwB5AHMAdABlAG0ALgBSAHUAbgB0AGkAbQBlAC4ASQBuAHQAZQByAG8AcABTAGUAcgB2AGkAYwBlAHMAOwAKAFsARwB1AGkAZAAoACIANQBDAEQARgAyAEMAOAAyAC0AOAA0ADEARQAtADQANQA0ADYALQA5ADcAMgAyAC0AMABDAEYANwA0ADAANwA4ADIAMgA5AEEAIgApACwAIABJAG4AdABlAHIAZgBhAGMAZQBUAHkAcABlACgAMQApAF0ACgBwAHUAYgBsAGkAYwAgAGkAbgB0AGUAcgBmAGEAYwBlACAASQBBAEUAVgAyACAAewAKACAAIABpAG4AdAAgAGYAMQAoACkAOwAgAGkAbgB0ACAAZgAyACgAKQA7ACAAaQBuAHQAIABmADMAKAApADsAIABpAG4AdAAgAGYANAAoACkAOwAKACAAIABpAG4AdAAgAFMAZQB0AE0AYQBzAHQAZQByAFYAbwBsAHUAbQBlAEwAZQB2AGUAbAAoAGYAbABvAGEAdAAgAHYALAAgAHIAZQBmACAAUwB5AHMAdABlAG0ALgBHAHUAaQBkACAAZwApADsACgAgACAAaQBuAHQAIABTAGUAdABNAGEAcwB0AGUAcgBWAG8AbAB1AG0AZQBMAGUAdgBlAGwAUwBjAGEAbABhAHIAKABmAGwAbwBhAHQAIAB2ACwAIAByAGUAZgAgAFMAeQBzAHQAZQBtAC4ARwB1AGkAZAAgAGcAKQA7AAoAIAAgAGkAbgB0ACAAZgA3ACgAKQA7ACAAaQBuAHQAIABmADgAKAApADsAIABpAG4AdAAgAGYAOQAoACkAOwAgAGkAbgB0ACAAZgAxADAAKAApADsAIABpAG4AdAAgAGYAMQAxACgAKQA7AAoAIAAgAGkAbgB0ACAAUwBlAHQATQB1AHQAZQAoAFsATQBhAHIAcwBoAGEAbABBAHMAKABVAG4AbQBhAG4AYQBnAGUAZABUAHkAcABlAC4AQgBvAG8AbAApAF0AYgBvAG8AbAAgAG0ALAAgAHIAZQBmACAAUwB5AHMAdABlAG0ALgBHAHUAaQBkACAAZwApADsACgAgACAAaQBuAHQAIABHAGUAdABNAHUAdABlACgAbwB1AHQAIABiAG8AbwBsACAAbQApADsACgB9AAoAWwBHAHUAaQBkACgAIgAwAEIARAA3AEEAMQBCAEUALQA3AEEAMQBBAC0ANAA0AEQAQgAtADgAMwA5ADcALQBDAEMANQAzADkAMgAzADgANwBCADUARQAiACkALAAgAEkAbgB0AGUAcgBmAGEAYwBlAFQAeQBwAGUAKAAxACkAXQAKAHAAdQBiAGwAaQBjACAAaQBuAHQAZQByAGYAYQBjAGUAIABJAE0ATQBEAEMAMgAgAHsACgAgACAAaQBuAHQAIABHAGUAdABDAG8AdQBuAHQAKABvAHUAdAAgAHUAaQBuAHQAIABjACkAOwAKACAAIABpAG4AdAAgAEkAdABlAG0AKAB1AGkAbgB0ACAAbgAsACAAbwB1AHQAIABJAE0ATQBEADIAIABkACkAOwAKAH0ACgBbAEcAdQBpAGQAKAAiAEQANgA2ADYAMAA2ADMARgAtADEANQA4ADcALQA0AEUANAAzAC0AOAAxAEYAMQAtAEIAOQA0ADgARQA4ADAANwAzADYAMwBGACIAKQAsACAASQBuAHQAZQByAGYAYQBjAGUAVAB5AHAAZQAoADEAKQBdAAoAcAB1AGIAbABpAGMAIABpAG4AdABlAHIAZgBhAGMAZQAgAEkATQBNAEQAMgAgAHsACgAgACAAaQBuAHQAIABBAGMAdABpAHYAYQB0AGUAKAByAGUAZgAgAFMAeQBzAHQAZQBtAC4ARwB1AGkAZAAgAGkAZAAsACAAaQBuAHQAIABjAHQAeAAsACAAUwB5AHMAdABlAG0ALgBJAG4AdABQAHQAcgAgAHAALAAgAFsATQBhAHIAcwBoAGEAbABBAHMAKABVAG4AbQBhAG4AYQBnAGUAZABUAHkAcABlAC4ASQBVAG4AawBuAG8AdwBuACkAXQAgAG8AdQB0ACAAbwBiAGoAZQBjAHQAIABpACkAOwAKAH0ACgBbAEcAdQBpAGQAKAAiAEEAOQA1ADYANgA0AEQAMgAtADkANgAxADQALQA0AEYAMwA1AC0AQQA3ADQANgAtAEQARQA4AEQAQgA2ADMANgAxADcARQA2ACIAKQAsACAASQBuAHQAZQByAGYAYQBjAGUAVAB5AHAAZQAoADEAKQBdAAoAcAB1AGIAbABpAGMAIABpAG4AdABlAHIAZgBhAGMAZQAgAEkATQBNAEUAMgAgAHsACgAgACAAaQBuAHQAIABFAG4AdQBtAEEAdQBkAGkAbwBFAG4AZABwAG8AaQBuAHQAcwAoAGkAbgB0ACAAZABhAHQAYQBGAGwAbwB3ACwAIABpAG4AdAAgAG0AYQBzAGsALAAgAG8AdQB0ACAASQBNAE0ARABDADIAIABjAG8AbAApADsACgAgACAAaQBuAHQAIABHAGUAdABEAGUAZgBhAHUAbAB0ACgAaQBuAHQAIABkAGEAdABhAEYAbABvAHcALAAgAGkAbgB0ACAAcgBvAGwAZQAsACAAbwB1AHQAIABJAE0ATQBEADIAIABkAGUAdgBpAGMAZQApADsACgB9AAoAWwBHAHUAaQBkACgAIgBCAEMARABFADAAMwA5ADUALQBFADUAMgBGAC0ANAA2ADcAQwAtADgARQAzAEQALQBDADQANQA3ADkAMgA5ADEANgA5ADIARQAiACkAXQAKAHAAdQBiAGwAaQBjACAAYwBsAGEAcwBzACAATQBNAEUAMgAgAHsAIAB9AAoAcAB1AGIAbABpAGMAIABjAGwAYQBzAHMAIABBAHUAMgAgAHsACgAgACAAcAB1AGIAbABpAGMAIABzAHQAYQB0AGkAYwAgAHYAbwBpAGQAIABNAHUAdABlAEEAbABsACgAYgBvAG8AbAAgAG0AdQB0AGUAKQAgAHsACgAgACAAIAAgAHYAYQByACAAZQAgAD0AIAAoAEkATQBNAEUAMgApAFMAeQBzAHQAZQBtAC4AQQBjAHQAaQB2AGEAdABvAHIALgBDAHIAZQBhAHQAZQBJAG4AcwB0AGEAbgBjAGUAKABTAHkAcwB0AGUAbQAuAFQAeQBwAGUALgBHAGUAdABUAHkAcABlAEYAcgBvAG0AQwBMAFMASQBEACgAdAB5AHAAZQBvAGYAKABNAE0ARQAyACkALgBHAFUASQBEACkAKQA7AAoAIAAgACAAIABJAE0ATQBEAEMAMgAgAGMAbwBsADsACgAgACAAIAAgAGUALgBFAG4AdQBtAEEAdQBkAGkAbwBFAG4AZABwAG8AaQBuAHQAcwAoADAALAAgADEALAAgAG8AdQB0ACAAYwBvAGwAKQA7AAoAIAAgACAAIAB1AGkAbgB0ACAAYwBuAHQAOwAgAGMAbwBsAC4ARwBlAHQAQwBvAHUAbgB0ACgAbwB1AHQAIABjAG4AdAApADsACgAgACAAIAAgAFMAeQBzAHQAZQBtAC4ARwB1AGkAZAAgAGcAIAA9ACAAUwB5AHMAdABlAG0ALgBHAHUAaQBkAC4ARQBtAHAAdAB5ADsACgAgACAAIAAgAGYAbwByACAAKAB1AGkAbgB0ACAAaQAgAD0AIAAwADsAIABpACAAPAAgAGMAbgB0ADsAIABpACsAKwApACAAewAKACAAIAAgACAAIAAgAEkATQBNAEQAMgAgAGQAOwAgAGMAbwBsAC4ASQB0AGUAbQAoAGkALAAgAG8AdQB0ACAAZAApADsACgAgACAAIAAgACAAIAB2AGEAcgAgAGkAaQBkACAAPQAgAHQAeQBwAGUAbwBmACgASQBBAEUAVgAyACkALgBHAFUASQBEADsAIABvAGIAagBlAGMAdAAgAG8AOwAKACAAIAAgACAAIAAgAGQALgBBAGMAdABpAHYAYQB0AGUAKAByAGUAZgAgAGkAaQBkACwAIAAxACwAIABTAHkAcwB0AGUAbQAuAEkAbgB0AFAAdAByAC4AWgBlAHIAbwAsACAAbwB1AHQAIABvACkAOwAKACAAIAAgACAAIAAgACgAKABJAEEARQBWADIAKQBvACkALgBTAGUAdABNAHUAdABlACgAbQB1AHQAZQAsACAAcgBlAGYAIABnACkAOwAKACAAIAAgACAAfQAKACAAIAB9AAoAfQAKACcAIAAtAEUAcgByAG8AcgBBAGMAdABpAG8AbgAgAFMAaQBsAGUAbgB0AGwAeQBDAG8AbgB0AGkAbgB1AGUAOwBbAEEAdQAyAF0AOgA6AE0AdQB0AGUAQQBsAGwAKAAkAGYAYQBsAHMAZQApAA==', { windowsHide: true }, function(){});
+          console.log('[unlock] 잠금 윈도우 종료 + 음소거 복구');
+        } catch(e){ console.warn('[unlock] 실패:', e.message); }
+        return;
+      }
+      if (cmd.action === 'audio_mute') {
+        exec('powershell -NoProfile -EncodedCommand QQBkAGQALQBUAHkAcABlACAALQBUAHkAcABlAEQAZQBmAGkAbgBpAHQAaQBvAG4AIAAnAAoAdQBzAGkAbgBnACAAUwB5AHMAdABlAG0ALgBSAHUAbgB0AGkAbQBlAC4ASQBuAHQAZQByAG8AcABTAGUAcgB2AGkAYwBlAHMAOwAKAFsARwB1AGkAZAAoACIANQBDAEQARgAyAEMAOAAyAC0AOAA0ADEARQAtADQANQA0ADYALQA5ADcAMgAyAC0AMABDAEYANwA0ADAANwA4ADIAMgA5AEEAIgApACwAIABJAG4AdABlAHIAZgBhAGMAZQBUAHkAcABlACgAMQApAF0ACgBwAHUAYgBsAGkAYwAgAGkAbgB0AGUAcgBmAGEAYwBlACAASQBBAEUAVgAyACAAewAKACAAIABpAG4AdAAgAGYAMQAoACkAOwAgAGkAbgB0ACAAZgAyACgAKQA7ACAAaQBuAHQAIABmADMAKAApADsAIABpAG4AdAAgAGYANAAoACkAOwAKACAAIABpAG4AdAAgAFMAZQB0AE0AYQBzAHQAZQByAFYAbwBsAHUAbQBlAEwAZQB2AGUAbAAoAGYAbABvAGEAdAAgAHYALAAgAHIAZQBmACAAUwB5AHMAdABlAG0ALgBHAHUAaQBkACAAZwApADsACgAgACAAaQBuAHQAIABTAGUAdABNAGEAcwB0AGUAcgBWAG8AbAB1AG0AZQBMAGUAdgBlAGwAUwBjAGEAbABhAHIAKABmAGwAbwBhAHQAIAB2ACwAIAByAGUAZgAgAFMAeQBzAHQAZQBtAC4ARwB1AGkAZAAgAGcAKQA7AAoAIAAgAGkAbgB0ACAAZgA3ACgAKQA7ACAAaQBuAHQAIABmADgAKAApADsAIABpAG4AdAAgAGYAOQAoACkAOwAgAGkAbgB0ACAAZgAxADAAKAApADsAIABpAG4AdAAgAGYAMQAxACgAKQA7AAoAIAAgAGkAbgB0ACAAUwBlAHQATQB1AHQAZQAoAFsATQBhAHIAcwBoAGEAbABBAHMAKABVAG4AbQBhAG4AYQBnAGUAZABUAHkAcABlAC4AQgBvAG8AbAApAF0AYgBvAG8AbAAgAG0ALAAgAHIAZQBmACAAUwB5AHMAdABlAG0ALgBHAHUAaQBkACAAZwApADsACgAgACAAaQBuAHQAIABHAGUAdABNAHUAdABlACgAbwB1AHQAIABiAG8AbwBsACAAbQApADsACgB9AAoAWwBHAHUAaQBkACgAIgAwAEIARAA3AEEAMQBCAEUALQA3AEEAMQBBAC0ANAA0AEQAQgAtADgAMwA5ADcALQBDAEMANQAzADkAMgAzADgANwBCADUARQAiACkALAAgAEkAbgB0AGUAcgBmAGEAYwBlAFQAeQBwAGUAKAAxACkAXQAKAHAAdQBiAGwAaQBjACAAaQBuAHQAZQByAGYAYQBjAGUAIABJAE0ATQBEAEMAMgAgAHsACgAgACAAaQBuAHQAIABHAGUAdABDAG8AdQBuAHQAKABvAHUAdAAgAHUAaQBuAHQAIABjACkAOwAKACAAIABpAG4AdAAgAEkAdABlAG0AKAB1AGkAbgB0ACAAbgAsACAAbwB1AHQAIABJAE0ATQBEADIAIABkACkAOwAKAH0ACgBbAEcAdQBpAGQAKAAiAEQANgA2ADYAMAA2ADMARgAtADEANQA4ADcALQA0AEUANAAzAC0AOAAxAEYAMQAtAEIAOQA0ADgARQA4ADAANwAzADYAMwBGACIAKQAsACAASQBuAHQAZQByAGYAYQBjAGUAVAB5AHAAZQAoADEAKQBdAAoAcAB1AGIAbABpAGMAIABpAG4AdABlAHIAZgBhAGMAZQAgAEkATQBNAEQAMgAgAHsACgAgACAAaQBuAHQAIABBAGMAdABpAHYAYQB0AGUAKAByAGUAZgAgAFMAeQBzAHQAZQBtAC4ARwB1AGkAZAAgAGkAZAAsACAAaQBuAHQAIABjAHQAeAAsACAAUwB5AHMAdABlAG0ALgBJAG4AdABQAHQAcgAgAHAALAAgAFsATQBhAHIAcwBoAGEAbABBAHMAKABVAG4AbQBhAG4AYQBnAGUAZABUAHkAcABlAC4ASQBVAG4AawBuAG8AdwBuACkAXQAgAG8AdQB0ACAAbwBiAGoAZQBjAHQAIABpACkAOwAKAH0ACgBbAEcAdQBpAGQAKAAiAEEAOQA1ADYANgA0AEQAMgAtADkANgAxADQALQA0AEYAMwA1AC0AQQA3ADQANgAtAEQARQA4AEQAQgA2ADMANgAxADcARQA2ACIAKQAsACAASQBuAHQAZQByAGYAYQBjAGUAVAB5AHAAZQAoADEAKQBdAAoAcAB1AGIAbABpAGMAIABpAG4AdABlAHIAZgBhAGMAZQAgAEkATQBNAEUAMgAgAHsACgAgACAAaQBuAHQAIABFAG4AdQBtAEEAdQBkAGkAbwBFAG4AZABwAG8AaQBuAHQAcwAoAGkAbgB0ACAAZABhAHQAYQBGAGwAbwB3ACwAIABpAG4AdAAgAG0AYQBzAGsALAAgAG8AdQB0ACAASQBNAE0ARABDADIAIABjAG8AbAApADsACgAgACAAaQBuAHQAIABHAGUAdABEAGUAZgBhAHUAbAB0ACgAaQBuAHQAIABkAGEAdABhAEYAbABvAHcALAAgAGkAbgB0ACAAcgBvAGwAZQAsACAAbwB1AHQAIABJAE0ATQBEADIAIABkAGUAdgBpAGMAZQApADsACgB9AAoAWwBHAHUAaQBkACgAIgBCAEMARABFADAAMwA5ADUALQBFADUAMgBGAC0ANAA2ADcAQwAtADgARQAzAEQALQBDADQANQA3ADkAMgA5ADEANgA5ADIARQAiACkAXQAKAHAAdQBiAGwAaQBjACAAYwBsAGEAcwBzACAATQBNAEUAMgAgAHsAIAB9AAoAcAB1AGIAbABpAGMAIABjAGwAYQBzAHMAIABBAHUAMgAgAHsACgAgACAAcAB1AGIAbABpAGMAIABzAHQAYQB0AGkAYwAgAHYAbwBpAGQAIABNAHUAdABlAEEAbABsACgAYgBvAG8AbAAgAG0AdQB0AGUAKQAgAHsACgAgACAAIAAgAHYAYQByACAAZQAgAD0AIAAoAEkATQBNAEUAMgApAFMAeQBzAHQAZQBtAC4AQQBjAHQAaQB2AGEAdABvAHIALgBDAHIAZQBhAHQAZQBJAG4AcwB0AGEAbgBjAGUAKABTAHkAcwB0AGUAbQAuAFQAeQBwAGUALgBHAGUAdABUAHkAcABlAEYAcgBvAG0AQwBMAFMASQBEACgAdAB5AHAAZQBvAGYAKABNAE0ARQAyACkALgBHAFUASQBEACkAKQA7AAoAIAAgACAAIABJAE0ATQBEAEMAMgAgAGMAbwBsADsACgAgACAAIAAgAGUALgBFAG4AdQBtAEEAdQBkAGkAbwBFAG4AZABwAG8AaQBuAHQAcwAoADAALAAgADEALAAgAG8AdQB0ACAAYwBvAGwAKQA7AAoAIAAgACAAIAB1AGkAbgB0ACAAYwBuAHQAOwAgAGMAbwBsAC4ARwBlAHQAQwBvAHUAbgB0ACgAbwB1AHQAIABjAG4AdAApADsACgAgACAAIAAgAFMAeQBzAHQAZQBtAC4ARwB1AGkAZAAgAGcAIAA9ACAAUwB5AHMAdABlAG0ALgBHAHUAaQBkAC4ARQBtAHAAdAB5ADsACgAgACAAIAAgAGYAbwByACAAKAB1AGkAbgB0ACAAaQAgAD0AIAAwADsAIABpACAAPAAgAGMAbgB0ADsAIABpACsAKwApACAAewAKACAAIAAgACAAIAAgAEkATQBNAEQAMgAgAGQAOwAgAGMAbwBsAC4ASQB0AGUAbQAoAGkALAAgAG8AdQB0ACAAZAApADsACgAgACAAIAAgACAAIAB2AGEAcgAgAGkAaQBkACAAPQAgAHQAeQBwAGUAbwBmACgASQBBAEUAVgAyACkALgBHAFUASQBEADsAIABvAGIAagBlAGMAdAAgAG8AOwAKACAAIAAgACAAIAAgAGQALgBBAGMAdABpAHYAYQB0AGUAKAByAGUAZgAgAGkAaQBkACwAIAAxACwAIABTAHkAcwB0AGUAbQAuAEkAbgB0AFAAdAByAC4AWgBlAHIAbwAsACAAbwB1AHQAIABvACkAOwAKACAAIAAgACAAIAAgACgAKABJAEEARQBWADIAKQBvACkALgBTAGUAdABNAHUAdABlACgAbQB1AHQAZQAsACAAcgBlAGYAIABnACkAOwAKACAAIAAgACAAfQAKACAAIAB9AAoAfQAKACcAIAAtAEUAcgByAG8AcgBBAGMAdABpAG8AbgAgAFMAaQBsAGUAbgB0AGwAeQBDAG8AbgB0AGkAbgB1AGUAOwBbAEEAdQAyAF0AOgA6AE0AdQB0AGUAQQBsAGwAKAAkAHQAcgB1AGUAKQA=', { windowsHide: true }, function(){});
+        console.log('[audio_mute] 음소거 토글');
+        return;
+      }
+      if (cmd.action === 'audio_unmute') {
+        exec('powershell -NoProfile -EncodedCommand QQBkAGQALQBUAHkAcABlACAALQBUAHkAcABlAEQAZQBmAGkAbgBpAHQAaQBvAG4AIAAnAAoAdQBzAGkAbgBnACAAUwB5AHMAdABlAG0ALgBSAHUAbgB0AGkAbQBlAC4ASQBuAHQAZQByAG8AcABTAGUAcgB2AGkAYwBlAHMAOwAKAFsARwB1AGkAZAAoACIANQBDAEQARgAyAEMAOAAyAC0AOAA0ADEARQAtADQANQA0ADYALQA5ADcAMgAyAC0AMABDAEYANwA0ADAANwA4ADIAMgA5AEEAIgApACwAIABJAG4AdABlAHIAZgBhAGMAZQBUAHkAcABlACgAMQApAF0ACgBwAHUAYgBsAGkAYwAgAGkAbgB0AGUAcgBmAGEAYwBlACAASQBBAEUAVgAyACAAewAKACAAIABpAG4AdAAgAGYAMQAoACkAOwAgAGkAbgB0ACAAZgAyACgAKQA7ACAAaQBuAHQAIABmADMAKAApADsAIABpAG4AdAAgAGYANAAoACkAOwAKACAAIABpAG4AdAAgAFMAZQB0AE0AYQBzAHQAZQByAFYAbwBsAHUAbQBlAEwAZQB2AGUAbAAoAGYAbABvAGEAdAAgAHYALAAgAHIAZQBmACAAUwB5AHMAdABlAG0ALgBHAHUAaQBkACAAZwApADsACgAgACAAaQBuAHQAIABTAGUAdABNAGEAcwB0AGUAcgBWAG8AbAB1AG0AZQBMAGUAdgBlAGwAUwBjAGEAbABhAHIAKABmAGwAbwBhAHQAIAB2ACwAIAByAGUAZgAgAFMAeQBzAHQAZQBtAC4ARwB1AGkAZAAgAGcAKQA7AAoAIAAgAGkAbgB0ACAAZgA3ACgAKQA7ACAAaQBuAHQAIABmADgAKAApADsAIABpAG4AdAAgAGYAOQAoACkAOwAgAGkAbgB0ACAAZgAxADAAKAApADsAIABpAG4AdAAgAGYAMQAxACgAKQA7AAoAIAAgAGkAbgB0ACAAUwBlAHQATQB1AHQAZQAoAFsATQBhAHIAcwBoAGEAbABBAHMAKABVAG4AbQBhAG4AYQBnAGUAZABUAHkAcABlAC4AQgBvAG8AbAApAF0AYgBvAG8AbAAgAG0ALAAgAHIAZQBmACAAUwB5AHMAdABlAG0ALgBHAHUAaQBkACAAZwApADsACgAgACAAaQBuAHQAIABHAGUAdABNAHUAdABlACgAbwB1AHQAIABiAG8AbwBsACAAbQApADsACgB9AAoAWwBHAHUAaQBkACgAIgAwAEIARAA3AEEAMQBCAEUALQA3AEEAMQBBAC0ANAA0AEQAQgAtADgAMwA5ADcALQBDAEMANQAzADkAMgAzADgANwBCADUARQAiACkALAAgAEkAbgB0AGUAcgBmAGEAYwBlAFQAeQBwAGUAKAAxACkAXQAKAHAAdQBiAGwAaQBjACAAaQBuAHQAZQByAGYAYQBjAGUAIABJAE0ATQBEAEMAMgAgAHsACgAgACAAaQBuAHQAIABHAGUAdABDAG8AdQBuAHQAKABvAHUAdAAgAHUAaQBuAHQAIABjACkAOwAKACAAIABpAG4AdAAgAEkAdABlAG0AKAB1AGkAbgB0ACAAbgAsACAAbwB1AHQAIABJAE0ATQBEADIAIABkACkAOwAKAH0ACgBbAEcAdQBpAGQAKAAiAEQANgA2ADYAMAA2ADMARgAtADEANQA4ADcALQA0AEUANAAzAC0AOAAxAEYAMQAtAEIAOQA0ADgARQA4ADAANwAzADYAMwBGACIAKQAsACAASQBuAHQAZQByAGYAYQBjAGUAVAB5AHAAZQAoADEAKQBdAAoAcAB1AGIAbABpAGMAIABpAG4AdABlAHIAZgBhAGMAZQAgAEkATQBNAEQAMgAgAHsACgAgACAAaQBuAHQAIABBAGMAdABpAHYAYQB0AGUAKAByAGUAZgAgAFMAeQBzAHQAZQBtAC4ARwB1AGkAZAAgAGkAZAAsACAAaQBuAHQAIABjAHQAeAAsACAAUwB5AHMAdABlAG0ALgBJAG4AdABQAHQAcgAgAHAALAAgAFsATQBhAHIAcwBoAGEAbABBAHMAKABVAG4AbQBhAG4AYQBnAGUAZABUAHkAcABlAC4ASQBVAG4AawBuAG8AdwBuACkAXQAgAG8AdQB0ACAAbwBiAGoAZQBjAHQAIABpACkAOwAKAH0ACgBbAEcAdQBpAGQAKAAiAEEAOQA1ADYANgA0AEQAMgAtADkANgAxADQALQA0AEYAMwA1AC0AQQA3ADQANgAtAEQARQA4AEQAQgA2ADMANgAxADcARQA2ACIAKQAsACAASQBuAHQAZQByAGYAYQBjAGUAVAB5AHAAZQAoADEAKQBdAAoAcAB1AGIAbABpAGMAIABpAG4AdABlAHIAZgBhAGMAZQAgAEkATQBNAEUAMgAgAHsACgAgACAAaQBuAHQAIABFAG4AdQBtAEEAdQBkAGkAbwBFAG4AZABwAG8AaQBuAHQAcwAoAGkAbgB0ACAAZABhAHQAYQBGAGwAbwB3ACwAIABpAG4AdAAgAG0AYQBzAGsALAAgAG8AdQB0ACAASQBNAE0ARABDADIAIABjAG8AbAApADsACgAgACAAaQBuAHQAIABHAGUAdABEAGUAZgBhAHUAbAB0ACgAaQBuAHQAIABkAGEAdABhAEYAbABvAHcALAAgAGkAbgB0ACAAcgBvAGwAZQAsACAAbwB1AHQAIABJAE0ATQBEADIAIABkAGUAdgBpAGMAZQApADsACgB9AAoAWwBHAHUAaQBkACgAIgBCAEMARABFADAAMwA5ADUALQBFADUAMgBGAC0ANAA2ADcAQwAtADgARQAzAEQALQBDADQANQA3ADkAMgA5ADEANgA5ADIARQAiACkAXQAKAHAAdQBiAGwAaQBjACAAYwBsAGEAcwBzACAATQBNAEUAMgAgAHsAIAB9AAoAcAB1AGIAbABpAGMAIABjAGwAYQBzAHMAIABBAHUAMgAgAHsACgAgACAAcAB1AGIAbABpAGMAIABzAHQAYQB0AGkAYwAgAHYAbwBpAGQAIABNAHUAdABlAEEAbABsACgAYgBvAG8AbAAgAG0AdQB0AGUAKQAgAHsACgAgACAAIAAgAHYAYQByACAAZQAgAD0AIAAoAEkATQBNAEUAMgApAFMAeQBzAHQAZQBtAC4AQQBjAHQAaQB2AGEAdABvAHIALgBDAHIAZQBhAHQAZQBJAG4AcwB0AGEAbgBjAGUAKABTAHkAcwB0AGUAbQAuAFQAeQBwAGUALgBHAGUAdABUAHkAcABlAEYAcgBvAG0AQwBMAFMASQBEACgAdAB5AHAAZQBvAGYAKABNAE0ARQAyACkALgBHAFUASQBEACkAKQA7AAoAIAAgACAAIABJAE0ATQBEAEMAMgAgAGMAbwBsADsACgAgACAAIAAgAGUALgBFAG4AdQBtAEEAdQBkAGkAbwBFAG4AZABwAG8AaQBuAHQAcwAoADAALAAgADEALAAgAG8AdQB0ACAAYwBvAGwAKQA7AAoAIAAgACAAIAB1AGkAbgB0ACAAYwBuAHQAOwAgAGMAbwBsAC4ARwBlAHQAQwBvAHUAbgB0ACgAbwB1AHQAIABjAG4AdAApADsACgAgACAAIAAgAFMAeQBzAHQAZQBtAC4ARwB1AGkAZAAgAGcAIAA9ACAAUwB5AHMAdABlAG0ALgBHAHUAaQBkAC4ARQBtAHAAdAB5ADsACgAgACAAIAAgAGYAbwByACAAKAB1AGkAbgB0ACAAaQAgAD0AIAAwADsAIABpACAAPAAgAGMAbgB0ADsAIABpACsAKwApACAAewAKACAAIAAgACAAIAAgAEkATQBNAEQAMgAgAGQAOwAgAGMAbwBsAC4ASQB0AGUAbQAoAGkALAAgAG8AdQB0ACAAZAApADsACgAgACAAIAAgACAAIAB2AGEAcgAgAGkAaQBkACAAPQAgAHQAeQBwAGUAbwBmACgASQBBAEUAVgAyACkALgBHAFUASQBEADsAIABvAGIAagBlAGMAdAAgAG8AOwAKACAAIAAgACAAIAAgAGQALgBBAGMAdABpAHYAYQB0AGUAKAByAGUAZgAgAGkAaQBkACwAIAAxACwAIABTAHkAcwB0AGUAbQAuAEkAbgB0AFAAdAByAC4AWgBlAHIAbwAsACAAbwB1AHQAIABvACkAOwAKACAAIAAgACAAIAAgACgAKABJAEEARQBWADIAKQBvACkALgBTAGUAdABNAHUAdABlACgAbQB1AHQAZQAsACAAcgBlAGYAIABnACkAOwAKACAAIAAgACAAfQAKACAAIAB9AAoAfQAKACcAIAAtAEUAcgByAG8AcgBBAGMAdABpAG8AbgAgAFMAaQBsAGUAbgB0AGwAeQBDAG8AbgB0AGkAbgB1AGUAOwBbAEEAdQAyAF0AOgA6AE0AdQB0AGUAQQBsAGwAKAAkAGYAYQBsAHMAZQApAA==', { windowsHide: true }, function(){});
+        console.log('[audio_unmute] 음소거 토글');
+        return;
+      }
+      if (cmd.action === 'shutdown') return new Promise(r => exec(`shutdown /s /t ${cmd.delay || 5}`, () => r('shutdown')));
+  if (cmd.action === 'lock_screen') return new Promise(r => exec('rundll32.exe user32.dll,LockWorkStation', () => r('locked')));
+  if (cmd.type === 'set_ip' && cmd.ip) return await setStaticIp(cmd.ip, cmd.subnet || '255.255.255.0', cmd.gateway || '', cmd.dns || '8.8.8.8');
+  if (cmd.action === 'ping' || cmd.type === 'ping') return 'pong';
+  if (cmd.type === 'connected' || cmd.type === 'reservations_sync') return;
+  return { unknown: cmd.action || cmd.type };
+}
+
+let ws = null;
+let myInfo = null;
+let myRoomId = null;
+let heartbeatTimer = null;
+
+function connect() {
+  console.log('[WS] 연결 시도 ->', BRIDGE_WS);
+  ws = new WebSocket(BRIDGE_WS);
+  
+  ws.on('open', () => {
+    console.log('[WS] OK 연결됨');
+    
+    const reg = {
+      type: 'register',
+      clientType: ROLE,
+      roomId: myRoomId,
+      hostname: myInfo.hostname,
+      ip: myInfo.ip,
+      mac: myInfo.mac,
+      agentVersion: '6.0'
+    };
+    ws.send(JSON.stringify(reg));
+    console.log(`[등록] roomId=${myRoomId} role=${ROLE} host=${myInfo.hostname}`);
+    
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
+    heartbeatTimer = setInterval(() => {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+          type: 'agent_report',
+          hostname: myInfo.hostname, ip: myInfo.ip, mac: myInfo.mac
+        }));
+      }
+    }, HEARTBEAT_SEC * 1000);
+  });
+  
+  ws.on('message', async (raw) => {
+    try {
+      const msg = JSON.parse(raw.toString());
+      console.log('[명령]', msg.action || msg.type);
+      const result = await handleCommand(msg);
+      if (result !== undefined && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'command_result', original: msg.action || msg.type, result }));
+      }
+    } catch(e) { console.error('[메시지] 오류:', e.message); }
+  });
+  
+  ws.on('close', () => {
+    console.log(`[WS] 끊김 - ${RECONNECT_SEC}초 후 재연결`);
+    if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+    setTimeout(connect, RECONNECT_SEC * 1000);
+  });
+  
+  ws.on('error', (e) => { console.error('[WS] 오류:', e.message); });
+}
+
 async function main() {
-  console.log('=== TechLab Room Agent 시작 ===');
-  const info   = getMyInfo();
-  const roomId = guessRoomId(info.ip); // IP 끝자리로 추측, null이면 서버가 배정
-  console.log(`내 정보: IP=${info.ip} MAC=${info.mac} 추측룸=${roomId || '자동배정'}`);
-
-  // 브리지 서버 탐색
-  await discoverBridge();
-
-  // 등록
-  try {
-    const result = await registerToServer(info, roomId);
-    startHeartbeat(info, result.roomId);
-  } catch(e) {
-    console.error('[등록] 실패:', e.message, '- 재시도...');
-    setTimeout(main, 10000);
-    return;
-  }
-
-  // 명령 수신 서버 시작
-  startCommandServer();
+  
+  myInfo = getMyInfo();
+  myRoomId = determineRoomId(myInfo);
+  console.log(`Bridge: ${BRIDGE_WS}`);
+  console.log(`Role:   ${ROLE}`);
+  console.log(`Host:   ${myInfo.hostname}`);
+  console.log(`IP:     ${myInfo.ip}`);
+  console.log(`MAC:    ${myInfo.mac}`);
+  console.log(`Room:   ${myRoomId}`);
+  console.log('===========================================');
+  connect();
 }
 
 main();

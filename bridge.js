@@ -77,11 +77,16 @@ wss.on('connection', (ws) => {
 
   ws.on('close', () => {
     const info = clients.get(clientId);
+    const sid = info?.storeId || STORE_ID;
     // 룸 에이전트면 offline 처리
     if (info?.type === 'room_agent' && info.roomId) {
       broadcast({ type: 'agent_offline', roomId: info.roomId }, 'admin');
     }
     clients.delete(clientId);
+    // presence: 이 매장의 마지막 연결이 끊겼으면 offline 표시
+    if (info && storeConnCount(sid) === 0) {
+      updatePresence(sid, false);
+    }
     console.log(`[WS] 클라이언트 해제 #${clientId} (총 ${clients.size}명)`);
   });
 });
@@ -102,7 +107,12 @@ async function handleClientMessage(clientId, msg) {
       info.hostname = msg.hostname || '';
       info.ip       = msg.ip || '';
       info.mac      = msg.mac || '';
-      console.log(`[WS] #${clientId} 등록: ${info.type}${info.roomId ? ' ('+info.roomId+')' : ''}`);
+      info.storeId  = msg.storeId || STORE_ID;   // 신원: 클라이언트가 보낸 매장ID, 없으면 store_001 fallback (기존 호환)
+      console.log(`[WS] #${clientId} 등록: ${info.type}${info.roomId ? ' ('+info.roomId+')' : ''} [${info.storeId}]`);
+      // presence: 이 매장의 첫 연결이면 online 표시
+      if (storeConnCount(info.storeId) === 1) {
+        updatePresence(info.storeId, true);
+      }
       // Admin 등록 시 현재 예약 목록 즉시 전송
       if (info.type === 'admin') {
         const reservations = await getReservations();
@@ -593,6 +603,32 @@ app.get('/health', (req, res) => {
 // ──────────────────────────────────────────
 // 9. 유틸
 // ──────────────────────────────────────────
+
+// ── presence: 매장 연결 생사 (stores/{sid}/health/presence) ──
+// health/heartbeat(곪음·3시간)와 분리된 별도 경로 → 연결 끊김만 실시간 감지
+function storeConnCount(storeId) {
+  let n = 0;
+  clients.forEach(info => { if ((info.storeId || STORE_ID) === storeId) n++; });
+  return n;
+}
+
+async function updatePresence(storeId, online) {
+  if (!db) return;   // 로컬 전용 모드면 skip
+  try {
+    const payload = {
+      online,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    };
+    if (!online) payload.offlineAt = admin.firestore.FieldValue.serverTimestamp();
+    await db.collection('stores').doc(storeId)
+            .collection('health').doc('presence')
+            .set(payload, { merge: true });
+    console.log(`[presence] ${storeId} → ${online ? 'ONLINE' : 'OFFLINE'}`);
+  } catch (e) {
+    console.warn(`[presence] ${storeId} 갱신 실패:`, e.message);
+  }
+}
+
 function send(clientId, data) {
   const info = clients.get(clientId);
   if (info?.ws?.readyState === WebSocket.OPEN) {
