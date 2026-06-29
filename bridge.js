@@ -59,6 +59,8 @@ const wss = new WebSocket.Server({ server });
 // 연결된 클라이언트 맵  { clientId → { ws, type, roomId? } }
 // type: 'admin' | 'kiosk' | 'room_agent'
 const clients = new Map();
+const _offTimers = {};                 // storeId → 5분 장애 판정 타이머 (서버에서 판정, 브라우저 무관)
+const WD_GRACE_MS = 5 * 60 * 1000;     // 연결 끊김 후 이 시간 미복구 시 장애 확정 (일시적 끊김 무시)
 let clientSeq = 0;
 
 wss.on('connection', (ws) => {
@@ -86,6 +88,12 @@ wss.on('connection', (ws) => {
     // presence: 이 매장의 마지막 연결이 끊겼으면 offline 표시
     if (info && storeConnCount(sid) === 0) {
       updatePresence(sid, false);
+      // 5분 장애 판정 — 서버에서 직접. 5분 뒤에도 0연결이면 장애 확정(alert.active)
+      if (_offTimers[sid]) clearTimeout(_offTimers[sid]);
+      _offTimers[sid] = setTimeout(() => {
+        delete _offTimers[sid];
+        if (storeConnCount(sid) === 0) markStoreAlert(sid, true);  // 여전히 끊김 → 장애 확정
+      }, WD_GRACE_MS);
     }
     console.log(`[WS] 클라이언트 해제 #${clientId} (총 ${clients.size}명)`);
   });
@@ -112,6 +120,9 @@ async function handleClientMessage(clientId, msg) {
       // presence: 이 매장의 첫 연결이면 online 표시
       if (storeConnCount(info.storeId) === 1) {
         updatePresence(info.storeId, true);
+        // 재연결 → 5분 타이머 취소 + 장애 해제 (복구되면 경보 멈춤)
+        if (_offTimers[info.storeId]) { clearTimeout(_offTimers[info.storeId]); delete _offTimers[info.storeId]; }
+        markStoreAlert(info.storeId, false);
       }
       // Admin 등록 시 현재 예약 목록 즉시 전송
       if (info.type === 'admin') {
@@ -626,6 +637,23 @@ async function updatePresence(storeId, online) {
     console.log(`[presence] ${storeId} → ${online ? 'ONLINE' : 'OFFLINE'}`);
   } catch (e) {
     console.warn(`[presence] ${storeId} 갱신 실패:`, e.message);
+  }
+}
+
+// 장애 확정/해제를 Firestore에 기록 — 서버가 판정한 "사건"이라 브라우저 새로고침과 무관
+// super는 이 alert.active 만 읽어서 경보 (판정은 안 함)
+async function markStoreAlert(storeId, active) {
+  if (!db) return;
+  try {
+    const alert = active
+      ? { active: true, since: admin.firestore.FieldValue.serverTimestamp() }
+      : { active: false };
+    await db.collection('stores').doc(storeId)
+            .collection('health').doc('presence')
+            .set({ alert }, { merge: true });
+    console.log(`[alert] ${storeId} → ${active ? 'ACTIVE (장애 확정, 5분 미복구)' : 'CLEAR (복구)'}`);
+  } catch (e) {
+    console.warn(`[alert] ${storeId} 기록 실패:`, e.message);
   }
 }
 
