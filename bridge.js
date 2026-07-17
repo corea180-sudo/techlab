@@ -433,6 +433,34 @@ async function sendFCM(fcmToken, notification, data = {}) {
 // 8. HTTP REST API (Admin ↔ Bridge)
 // ──────────────────────────────────────────
 
+// ── 인증 미들웨어 ──────────────────────────
+//  브라우저 호출(admin/owner/super/apt): Firebase ID 토큰(Authorization: Bearer) 검증
+//  기계 호출(가디언 등): 공유시크릿(X-Guardian-Secret 헤더 또는 body.secret)
+//  라이브 안 깨는 2단계 롤아웃: AUTH_ENFORCE≠'1'이면 미인증도 통과시키되 경고 로그만 남김
+//   → 실호출이 전부 토큰 붙여 들어오는지 로그로 확인 후, Render env AUTH_ENFORCE=1 로 강제 차단.
+const AUTH_ENFORCE = process.env.AUTH_ENFORCE === '1';
+async function requireAuth(req, res, next) {
+  // 1) 공유시크릿 (기계 호출)
+  const hs = req.get('X-Guardian-Secret') || (req.body && req.body.secret);
+  if (GUARDIAN_SECRET && hs === GUARDIAN_SECRET) { req.authKind = 'secret'; return next(); }
+  // 2) Firebase ID 토큰 (브라우저 로그인 앱)
+  const m = (req.get('Authorization') || '').match(/^Bearer (.+)$/i);
+  if (m && admin.apps.length) {
+    try {
+      const dec = await admin.auth().verifyIdToken(m[1]);
+      req.authUid = dec.uid; req.authKind = 'token';
+      return next();
+    } catch (e) { /* 무효/만료 토큰 → 아래 미인증 처리 */ }
+  }
+  // 3) 미인증
+  console.warn(`[auth] 미인증 접근: ${req.method} ${req.path} origin=${req.get('origin') || '-'} enforce=${AUTH_ENFORCE}`);
+  if (AUTH_ENFORCE) return res.status(401).json({ error: 'unauthorized' });
+  return next();  // 모니터 모드: 통과(경고만) — 롤아웃 중 라이브 보호
+}
+// 민감 엔드포인트에만 적용 (prefix). /health는 공개 유지, /guardian-event는 자체 시크릿 검사.
+//  '/agent' prefix가 /agents·/agent/:id/command 모두 커버, /reservations·/rooms 도 하위 포함.
+app.use(['/agents', '/agent', '/reservations', '/rooms'], requireAuth);
+
 // 연결된 에이전트 목록
 app.get('/agents', (req, res) => {
   const wantStore = req.query.storeId || null;   // ★매장별 필터 (하위호환: 파라미터 없으면 기존대로 전체)
