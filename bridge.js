@@ -118,10 +118,15 @@ async function handleClientMessage(clientId, msg) {
       info.hostname = msg.hostname || '';
       info.ip       = msg.ip || '';
       info.mac      = msg.mac || '';
+      const _prevStoreId = info.storeId;         // 매장전환 감지용 (직전 등록 storeId, 첫 등록이면 undefined)
       info.storeId  = msg.storeId || STORE_ID;   // 신원: 클라이언트가 보낸 매장ID, 없으면 store_001 fallback (기존 호환)
       console.log(`[WS] #${clientId} 등록: ${info.type}${info.roomId ? ' ('+info.roomId+')' : ''} [${info.storeId}]`);
       // presence: 등록될 때마다 online 보장 (중복은 updatePresence 내부 dedup) → stale-false 자가치유
       updatePresence(info.storeId, true);
+      // 매장전환(같은 PC가 002→001 등 캐시 다중ID) → 옛 매장 연결이 0이 되면 그 매장 online 즉시 정정 (유령 방지, 근본)
+      if (_prevStoreId && _prevStoreId !== info.storeId && storeConnCount(_prevStoreId) === 0) {
+        updatePresence(_prevStoreId, false);
+      }
       // 재연결 → 5분 타이머 취소 + 장애 해제 (복구되면 경보 멈춤)
       if (_offTimers[info.storeId]) { clearTimeout(_offTimers[info.storeId]); delete _offTimers[info.storeId]; }
       markStoreAlert(info.storeId, false);
@@ -703,6 +708,34 @@ async function markStoreAlert(storeId, active) {
   }
 }
 
+// 🩶 유령 online 정리 — 이전 브리지 세션(재배포)·매장전환으로 online=true가 굳었지만
+//    실제 WS 연결이 0인 매장을 offline로 근본정정. super는 그대로 진실을 읽음(화면 마스킹 아님).
+//    부팅 45초 뒤 1회만(에이전트 재접속 대기 후). per-매장 폴링 아님 → 배포당 1회, 무과금.
+async function reconcilePhantomPresence() {
+  if (!db) return;
+  try {
+    const storeRefs = await db.collection('stores').listDocuments();
+    let fixed = 0;
+    for (const sRef of storeRefs) {
+      const sid = sRef.id;
+      if (storeConnCount(sid) > 0) continue;   // 실제 연결 있으면 진짜 online → 손대지 않음
+      const pRef = sRef.collection('health').doc('presence');
+      const snap = await pRef.get();
+      if (snap.exists && snap.data().online === true) {
+        await pRef.set({
+          online: false,
+          offlineAt: admin.firestore.FieldValue.serverTimestamp(),
+          reconciledAt: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+        _presenceState[sid] = false;
+        fixed++;
+        console.log(`[reconcile] 유령 online 정정 → offline: ${sid}`);
+      }
+    }
+    console.log(`[reconcile] 완료 (실연결 0인 유령 ${fixed}건 offline 정정)`);
+  } catch (e) { console.warn('[reconcile] 실패:', e.message); }
+}
+
 function send(clientId, data) {
   const info = clients.get(clientId);
   if (info?.ws?.readyState === WebSocket.OPEN) {
@@ -742,6 +775,8 @@ server.listen(PORT, () => {
   console.log('');
   startFirestoreListener();
   startAutoCancelOverdue();  // 🔥 2026-04-25: 1시간 초과 미사용 예약 자동 취소
+  // 🩶 유령 online 정리 — 재배포/이전세션으로 굳은 online=true를 실연결 0이면 offline로 근본정정 (부팅 45초 뒤 1회)
+  setTimeout(reconcilePhantomPresence, 45 * 1000);
 });
 
 // 🔥 2026-04-25: 1시간 초과 미사용 예약 자동 취소 (노쇼 정리)
