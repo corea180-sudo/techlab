@@ -61,6 +61,7 @@ const wss = new WebSocket.Server({ server });
 const clients = new Map();
 const _offTimers = {};                 // storeId → 5분 장애 판정 타이머 (서버에서 판정, 브라우저 무관)
 const _alertState = {};                // storeId → 현재 장애확정 상태 (블랙박스 이벤트 전환 판정용)
+const GUARDIAN_SECRET = process.env.GUARDIAN_SECRET || '';   // 가디언 이벤트 쓰기 공유 시크릿 (Render env)
 const WD_GRACE_MS = 5 * 60 * 1000;     // 연결 끊김 후 이 시간 미복구 시 장애 확정 (일시적 끊김 무시)
 let clientSeq = 0;
 
@@ -446,6 +447,22 @@ app.get('/agents', (req, res) => {
     }
   });
   res.json(result);
+});
+
+// 🩶 가디언 이벤트 수신 (크래시→재시작·서킷브레이커 저하·종료 등)
+//    가디언은 storeId를 모름 → 자기 hostname만 보냄. 같은 PC의 등록 에이전트(hostname 일치)로 storeId 매핑.
+//    쓰기 엔드포인트라 공유 시크릿 필수(GUARDIAN_SECRET env). 기록은 2a와 동일한 events.log.
+app.post('/guardian-event', (req, res) => {
+  const { host, ev, detail, secret } = req.body || {};
+  if (!GUARDIAN_SECRET || secret !== GUARDIAN_SECRET) return res.status(403).json({ error: 'forbidden' });
+  if (!host || !ev) return res.status(400).json({ error: 'host and ev required' });
+  let sid = null;
+  clients.forEach(info => {
+    if (info.type === 'room_agent' && (info.hostname || '').toLowerCase() === String(host).toLowerCase()) sid = info.storeId || sid;
+  });
+  if (!sid) return res.status(404).json({ error: 'store not resolved for host', host });
+  logGuardianEvent(sid, String(ev).slice(0, 40), detail);
+  res.json({ ok: true, storeId: sid, ev });
 });
 
 // 예약 목록 (Admin 초기 로드용)
