@@ -60,6 +60,7 @@ const wss = new WebSocket.Server({ server });
 // type: 'admin' | 'kiosk' | 'room_agent'
 const clients = new Map();
 const _offTimers = {};                 // storeId → 5분 장애 판정 타이머 (서버에서 판정, 브라우저 무관)
+const _alertState = {};                // storeId → 현재 장애확정 상태 (블랙박스 이벤트 전환 판정용)
 const WD_GRACE_MS = 5 * 60 * 1000;     // 연결 끊김 후 이 시간 미복구 시 장애 확정 (일시적 끊김 무시)
 let clientSeq = 0;
 
@@ -645,8 +646,29 @@ async function updatePresence(storeId, online) {
 
 // 장애 확정/해제를 Firestore에 기록 — 서버가 판정한 "사건"이라 브라우저 새로고침과 무관
 // super는 이 alert.active 만 읽어서 경보 (판정은 안 함)
+// 🩶 블랙박스 이벤트 로그 — stores/{sid}/health/events.log (최근 14일 + 최근 200건 링버퍼)
+//    이벤트 드뭄(진짜 다운/복구 때만) → Firestore 쓰기 사실상 무과금. super·클로드가 읽어 이상유무 판정.
+async function logGuardianEvent(storeId, ev, detail) {
+  if (!db) return;
+  try {
+    const entry = { t: Date.now(), ev };
+    if (detail != null) entry.detail = String(detail).slice(0, 200);
+    const ref = db.collection('stores').doc(storeId).collection('health').doc('events');
+    const snap = await ref.get();
+    let log = (snap.exists && Array.isArray(snap.data().log)) ? snap.data().log : [];
+    log.push(entry);
+    const cutoff = Date.now() - 14 * 24 * 60 * 60 * 1000;
+    log = log.filter(e => (e.t || 0) >= cutoff).slice(-200);
+    await ref.set({ log, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+    console.log(`[event] ${storeId} → ${ev}`);
+  } catch (e) { console.warn(`[event] ${storeId} 기록 실패:`, e.message); }
+}
+
 async function markStoreAlert(storeId, active) {
   if (!db) return;
+  // 블랙박스: 장애확정↔복구 전환 시에만 기록 (재접속 blip·재배포는 전환 아님 → 무기록)
+  const _prev = _alertState[storeId] || false;
+  if (_prev !== active) { _alertState[storeId] = active; logGuardianEvent(storeId, active ? 'down' : 'up'); }
   try {
     const alert = active
       ? { active: true, since: admin.firestore.FieldValue.serverTimestamp() }
