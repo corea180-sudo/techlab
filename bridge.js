@@ -429,9 +429,11 @@ async function sendFCM(fcmToken, notification, data = {}) {
 
 // 연결된 에이전트 목록
 app.get('/agents', (req, res) => {
+  const wantStore = req.query.storeId || null;   // ★매장별 필터 (하위호환: 파라미터 없으면 기존대로 전체)
   const result = {};
   clients.forEach((info, id) => {
     if (info.type === 'room_agent' && info.roomId) {
+      if (wantStore && (info.storeId || null) !== wantStore) return;   // 그 매장 것만 반환
       result[info.roomId] = {
         clientId: id,
         storeId:  info.storeId || null,
