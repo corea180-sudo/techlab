@@ -61,6 +61,7 @@ const wss = new WebSocket.Server({ server });
 const clients = new Map();
 const _offTimers = {};                 // storeId → 5분 장애 판정 타이머 (서버에서 판정, 브라우저 무관)
 const _alertState = {};                // storeId → 현재 장애확정 상태 (블랙박스 이벤트 전환 판정용)
+const _presenceState = {};             // storeId → 마지막 쓴 online (중복쓰기 방지 + stale 자가치유)
 const GUARDIAN_SECRET = process.env.GUARDIAN_SECRET || '';   // 가디언 이벤트 쓰기 공유 시크릿 (Render env)
 const WD_GRACE_MS = 5 * 60 * 1000;     // 연결 끊김 후 이 시간 미복구 시 장애 확정 (일시적 끊김 무시)
 let clientSeq = 0;
@@ -119,13 +120,11 @@ async function handleClientMessage(clientId, msg) {
       info.mac      = msg.mac || '';
       info.storeId  = msg.storeId || STORE_ID;   // 신원: 클라이언트가 보낸 매장ID, 없으면 store_001 fallback (기존 호환)
       console.log(`[WS] #${clientId} 등록: ${info.type}${info.roomId ? ' ('+info.roomId+')' : ''} [${info.storeId}]`);
-      // presence: 이 매장의 첫 연결이면 online 표시
-      if (storeConnCount(info.storeId) === 1) {
-        updatePresence(info.storeId, true);
-        // 재연결 → 5분 타이머 취소 + 장애 해제 (복구되면 경보 멈춤)
-        if (_offTimers[info.storeId]) { clearTimeout(_offTimers[info.storeId]); delete _offTimers[info.storeId]; }
-        markStoreAlert(info.storeId, false);
-      }
+      // presence: 등록될 때마다 online 보장 (중복은 updatePresence 내부 dedup) → stale-false 자가치유
+      updatePresence(info.storeId, true);
+      // 재연결 → 5분 타이머 취소 + 장애 해제 (복구되면 경보 멈춤)
+      if (_offTimers[info.storeId]) { clearTimeout(_offTimers[info.storeId]); delete _offTimers[info.storeId]; }
+      markStoreAlert(info.storeId, false);
       // Admin 등록 시 현재 예약 목록 즉시 전송
       if (info.type === 'admin') {
         const reservations = await getReservations();
@@ -646,6 +645,8 @@ function storeConnCount(storeId) {
 
 async function updatePresence(storeId, online) {
   if (!db) return;   // 로컬 전용 모드면 skip
+  if (_presenceState[storeId] === online) return;   // 이미 그 상태 → 중복쓰기 방지
+  _presenceState[storeId] = online;
   try {
     const payload = {
       online,
@@ -657,6 +658,7 @@ async function updatePresence(storeId, online) {
             .set(payload, { merge: true });
     console.log(`[presence] ${storeId} → ${online ? 'ONLINE' : 'OFFLINE'}`);
   } catch (e) {
+    _presenceState[storeId] = undefined;   // 실패 → 다음에 재시도 가능
     console.warn(`[presence] ${storeId} 갱신 실패:`, e.message);
   }
 }
@@ -683,9 +685,11 @@ async function logGuardianEvent(storeId, ev, detail) {
 
 async function markStoreAlert(storeId, active) {
   if (!db) return;
-  // 블랙박스: 장애확정↔복구 전환 시에만 기록 (재접속 blip·재배포는 전환 아님 → 무기록)
+  // 전환 없으면 쓰기·로그 모두 skip (재접속 blip·재배포는 전환 아님, 중복쓰기 방지)
   const _prev = _alertState[storeId] || false;
-  if (_prev !== active) { _alertState[storeId] = active; logGuardianEvent(storeId, active ? 'down' : 'up'); }
+  if (_prev === active) return;
+  _alertState[storeId] = active;
+  logGuardianEvent(storeId, active ? 'down' : 'up');
   try {
     const alert = active
       ? { active: true, since: admin.firestore.FieldValue.serverTimestamp() }
