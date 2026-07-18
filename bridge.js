@@ -51,6 +51,13 @@ const server = http.createServer(app);
 app.use(cors());
 app.use(express.json());
 
+// ── 무과금 대시보드용: 브리지 발생 Firestore 쓰기 실측 카운터 (인메모리, 재시작 시 리셋) ──
+const _usageStat = { bootAt: Date.now(), writes: 0, byKind: {} };
+function bumpWrite(kind) {
+  _usageStat.writes++;
+  _usageStat.byKind[kind] = (_usageStat.byKind[kind] || 0) + 1;
+}
+
 // ──────────────────────────────────────────
 // 3. WebSocket 서버
 // ──────────────────────────────────────────
@@ -664,6 +671,18 @@ app.get('/health', (req, res) => {
   });
 });
 
+// 무과금 대시보드: 브리지 부팅 후 발생시킨 Firestore 쓰기 실측치 (인증 필요)
+app.get('/usage', requireAuth, (req, res) => {
+  res.json({
+    ok:       true,
+    bootAt:   _usageStat.bootAt,
+    sinceMs:  Date.now() - _usageStat.bootAt,
+    clients:  clients.size,
+    writes:   _usageStat.writes,
+    byKind:   _usageStat.byKind
+  });
+});
+
 // ──────────────────────────────────────────
 // 9. 유틸
 // ──────────────────────────────────────────
@@ -689,6 +708,7 @@ async function updatePresence(storeId, online) {
     await db.collection('stores').doc(storeId)
             .collection('health').doc('presence')
             .set(payload, { merge: true });
+    bumpWrite('presence');
     console.log(`[presence] ${storeId} → ${online ? 'ONLINE' : 'OFFLINE'}`);
   } catch (e) {
     _presenceState[storeId] = undefined;   // 실패 → 다음에 재시도 가능
@@ -712,6 +732,7 @@ async function logGuardianEvent(storeId, ev, detail) {
     const cutoff = Date.now() - 14 * 24 * 60 * 60 * 1000;
     log = log.filter(e => (e.t || 0) >= cutoff).slice(-200);
     await ref.set({ log, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+    bumpWrite('event');
     console.log(`[event] ${storeId} → ${ev}`);
   } catch (e) { console.warn(`[event] ${storeId} 기록 실패:`, e.message); }
 }
@@ -730,6 +751,7 @@ async function markStoreAlert(storeId, active) {
     await db.collection('stores').doc(storeId)
             .collection('health').doc('presence')
             .set({ alert }, { merge: true });
+    bumpWrite('alert');
     console.log(`[alert] ${storeId} → ${active ? 'ACTIVE (장애 확정, 5분 미복구)' : 'CLEAR (복구)'}`);
   } catch (e) {
     console.warn(`[alert] ${storeId} 기록 실패:`, e.message);
@@ -757,6 +779,7 @@ async function reconcilePhantomPresence() {
         }, { merge: true });
         _presenceState[sid] = false;
         fixed++;
+        bumpWrite('reconcile');
         console.log(`[reconcile] 유령 online 정정 → offline: ${sid}`);
       }
     }
