@@ -534,6 +534,36 @@ app.post('/claim-agents', async (req, res) => {
   res.json({ ok: true, storeId, claimed, retagged, total: macs.length });
 });
 
+// 📍 도착이벤트 수신 (손님앱 지오펜스가 매장 반경 진입 시 서버로 쏨 → Firestore stores/{sid}/arrivals)
+//    폰은 무인증(Firestore 직접쓰기 불가·익명인증 꺼짐)이라 브리지가 어드민 크레덴셜로 대신 기록한다.
+//    어드민 수신부(startArrivalListener)가 이 문서를 감지해 띵동+TTS. 필드=name/type/room/atMs(어드민 규격).
+const _arrLast = {};                                   // sid|name → 마지막 기록 ms (지오펜스 바운스 스팸 차단)
+app.post('/arrival', async (req, res) => {
+  const b = req.body || {};
+  const storeId = String(b.storeId || '').trim();
+  if (!/^store_[A-Za-z0-9_]+$/.test(storeId)) return res.status(400).json({ ok: false, error: 'bad storeId' });
+  if (!db) return res.status(503).json({ ok: false, error: 'no db' });
+  const name = String(b.name || '고객').slice(0, 40);
+  const type = (String(b.type || 'dinein') === 'pickup') ? 'pickup' : 'dinein';
+  const room = String(b.room || b.seat || '').slice(0, 30);
+  const now  = Date.now();
+  const key  = storeId + '|' + name;
+  if (_arrLast[key] && now - _arrLast[key] < 90000) return res.json({ ok: true, deduped: true });
+  _arrLast[key] = now;
+  try {
+    await db.collection('stores').doc(storeId).collection('arrivals').add({
+      name, type, room, source: String(b.source || 'geofence').slice(0, 20),
+      atMs: now, createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+    bumpWrite('arrival');
+    console.log(`[arrival] ${storeId} ← ${name} (${type})`);
+    res.json({ ok: true });
+  } catch (e) {
+    console.warn('[arrival] 실패', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // 🩶 가디언 이벤트 수신 (크래시→재시작·서킷브레이커 저하·종료 등)
 //    가디언은 storeId를 모름 → 자기 hostname만 보냄. 같은 PC의 등록 에이전트(hostname 일치)로 storeId 매핑.
 //    쓰기 엔드포인트라 공유 시크릿 필수(GUARDIAN_SECRET env). 기록은 2a와 동일한 events.log.
