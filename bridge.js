@@ -548,7 +548,7 @@ app.post('/arrival', async (req, res) => {
   const room = String(b.room || b.seat || '').slice(0, 30);
   const now  = Date.now();
   const key  = storeId + '|' + name;
-  if (_arrLast[key] && now - _arrLast[key] < 90000) return res.json({ ok: true, deduped: true });
+  if (_arrLast[key] && now - _arrLast[key] < 30000) return res.json({ ok: true, deduped: true });
   _arrLast[key] = now;
   try {
     await db.collection('stores').doc(storeId).collection('arrivals').add({
