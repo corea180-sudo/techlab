@@ -44,6 +44,23 @@ const STORE_ID = process.env.STORE_ID || 'store_001';
 const PORT     = parseInt(process.env.PORT || '3000');
 
 // ──────────────────────────────────────────
+// MAC→매장 기억 (어드민이 물린 MAC = 정답지 · 재접속해도 유지)
+//   어드민이 /claim-agents 로 알려준 MAC은 register 때마다 이 매장으로 재입힘.
+//   → 헤드리스 타석기(에이전트만·기본 store_001)도 콜드스타트/재접속 후 매장 유지.
+// ──────────────────────────────────────────
+const _macStore = {};                                    // { normmac: storeId }
+const _normMac  = m => String(m || '').toLowerCase().replace(/[^0-9a-f]/g, '');
+async function _loadMacStore() {
+  if (!db) return;
+  try {
+    const snap = await db.collection('agentStoreMap').get();
+    snap.forEach(d => { const v = d.data() || {}; if (v.storeId) _macStore[d.id] = v.storeId; });
+    console.log(`[macStore] MAC→매장 기억 복원 ${Object.keys(_macStore).length}건`);
+  } catch (e) { console.warn('[macStore] 복원 실패:', e.message); }
+}
+_loadMacStore();
+
+// ──────────────────────────────────────────
 // 2. Express HTTP 서버
 // ──────────────────────────────────────────
 const app    = express();
@@ -127,6 +144,8 @@ async function handleClientMessage(clientId, msg) {
       info.mac      = msg.mac || '';
       const _prevStoreId = info.storeId;         // 매장전환 감지용 (직전 등록 storeId, 첫 등록이면 undefined)
       info.storeId  = msg.storeId || STORE_ID;   // 신원: 클라이언트가 보낸 매장ID, 없으면 store_001 fallback (기존 호환)
+      const _ovStore = _macStore[_normMac(info.mac)];
+      if (_ovStore) info.storeId = _ovStore;     // ★어드민이 물린 MAC이면 기억된 매장으로 재입힘(재접속해도 유지)
       console.log(`[WS] #${clientId} 등록: ${info.type}${info.roomId ? ' ('+info.roomId+')' : ''} [${info.storeId}]`);
       // presence: 등록될 때마다 online 보장 (중복은 updatePresence 내부 dedup) → stale-false 자가치유
       updatePresence(info.storeId, true);
@@ -466,7 +485,7 @@ async function requireAuth(req, res, next) {
 }
 // 민감 엔드포인트에만 적용 (prefix). /health는 공개 유지, /guardian-event는 자체 시크릿 검사.
 //  '/agent' prefix가 /agents·/agent/:id/command 모두 커버, /reservations·/rooms 도 하위 포함.
-app.use(['/agents', '/agent', '/reservations', '/rooms'], requireAuth);
+app.use(['/agents', '/agent', '/claim-agents', '/reservations', '/rooms'], requireAuth);
 
 // 연결된 에이전트 목록
 app.get('/agents', (req, res) => {
@@ -486,6 +505,33 @@ app.get('/agents', (req, res) => {
     }
   });
   res.json(result);
+});
+
+// 어드민이 "이 MAC들은 내 매장 것"이라 통보 → MAC→매장 기억 + 접속 중이면 즉시 재태그
+//   설치는 그대로(에이전트 기본 store_001) 두고, 어드민이 물린 MAC으로 매장을 확정한다.
+//   기억은 register 때마다 재적용(위 _macStore) → 헤드리스 타석기도 재접속 후 매장 유지.
+app.post('/claim-agents', async (req, res) => {
+  const storeId = String((req.body && req.body.storeId) || '').trim();
+  const macsIn  = Array.isArray(req.body && req.body.macs) ? req.body.macs : [];
+  if (!/^store_[A-Za-z0-9_]+$/.test(storeId)) return res.status(400).json({ ok: false, error: 'bad storeId' });
+  const macs = [...new Set(macsIn.map(_normMac).filter(m => m.length === 12))];
+  let claimed = 0, retagged = 0;
+  for (const m of macs) {
+    if (_macStore[m] !== storeId) {
+      _macStore[m] = storeId;
+      if (db) { try { await db.collection('agentStoreMap').doc(m).set({ storeId, mac: m, updatedAt: Date.now() }); bumpWrite('claim'); } catch (_) {} }
+      claimed++;
+    }
+    clients.forEach(info => {
+      if (_normMac(info.mac) === m && info.storeId !== storeId) {
+        info.storeId = storeId; retagged++;
+        updatePresence(storeId, true);
+        if (info.type === 'room_agent') broadcast({ type: 'agent_online', roomId: info.roomId, hostname: info.hostname, ip: info.ip, mac: info.mac }, 'admin');
+      }
+    });
+  }
+  console.log(`[claim] ${storeId} ← MAC ${macs.length}개 (신규기억 ${claimed}, 즉시재태그 ${retagged})`);
+  res.json({ ok: true, storeId, claimed, retagged, total: macs.length });
 });
 
 // 🩶 가디언 이벤트 수신 (크래시→재시작·서킷브레이커 저하·종료 등)
