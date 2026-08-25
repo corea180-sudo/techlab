@@ -837,6 +837,7 @@ async function markStoreAlert(storeId, active) {
 // 🩶 유령 online 정리 — 이전 브리지 세션(재배포)·매장전환으로 online=true가 굳었지만
 //    실제 WS 연결이 0인 매장을 offline로 근본정정. super는 그대로 진실을 읽음(화면 마스킹 아님).
 //    부팅 45초 뒤 1회만(에이전트 재접속 대기 후). per-매장 폴링 아님 → 배포당 1회, 무과금.
+//    ★2026-08-25 — 이 자리에서 경보(alert.active) 씨앗도 함께 복원한다(제12-4조). 쓰기는 사고 복구 시 1건뿐.
 async function reconcilePhantomPresence() {
   if (!db) return;
   try {
@@ -844,9 +845,21 @@ async function reconcilePhantomPresence() {
     let fixed = 0;
     for (const sRef of storeRefs) {
       const sid = sRef.id;
-      if (storeConnCount(sid) > 0) continue;   // 실제 연결 있으면 진짜 online → 손대지 않음
       const pRef = sRef.collection('health').doc('presence');
       const snap = await pRef.get();
+      /* ★2026-08-25 정정 — 경보(alert.active)의 「끄는 근거」를 저장된 값에서 되살린다.
+         _alertState 는 메모리라 브리지가 재시작하면 통째로 빈다. 그러면 매장이 다시 붙어
+         markStoreAlert(sid, false) 를 불러도 _prev 가 false 라 「전환 없음」으로 보고 그냥 돌아갔고,
+         Firestore 의 alert.active 는 켜진 채 영영 남았다(감곡점 08-23 16:31 → 08-25 확인).
+         → 부팅 1회 이 자리에서 저장값을 씨앗으로 넣어 전환 판정이 다시 성립하게 한다.
+         정본 = failover-ops-guide.md 제12-4조 · collab-charter.md 제8장 8항 */
+      const _sAlert = !!(snap.exists && snap.data().alert && snap.data().alert.active);
+      _alertState[sid] = _sAlert;
+      if (storeConnCount(sid) > 0) {
+        // 지금 붙어 있는데 경보가 켜져 있으면 그 자리에서 내린다(씨앗이 true 라 전환이 성립해 실제로 쓰인다)
+        if (_sAlert) markStoreAlert(sid, false);
+        continue;                              // 실제 연결 있으면 진짜 online → 손대지 않음
+      }
       if (snap.exists && snap.data().online === true) {
         await pRef.set({
           online: false,
