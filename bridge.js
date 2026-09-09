@@ -142,6 +142,7 @@ async function handleClientMessage(clientId, msg) {
       info.hostname = msg.hostname || '';
       info.ip       = msg.ip || '';
       info.mac      = msg.mac || '';
+      info.rdId     = String(msg.rdId || info.rdId || '').replace(/[^0-9]/g, '');   // 에이전트가 스스로 읽은 원격 접속 ID — 한 번 받으면 지우지 않는다
       const _prevStoreId = info.storeId;         // 매장전환 감지용 (직전 등록 storeId, 첫 등록이면 undefined)
       info.storeId  = msg.storeId || STORE_ID;   // 신원: 클라이언트가 보낸 매장ID, 없으면 store_001 fallback (기존 호환)
       const _ovStore = _macStore[_normMac(info.mac)];
@@ -500,6 +501,7 @@ app.get('/agents', (req, res) => {
         hostname: info.hostname,
         ip:       info.ip,
         mac:      info.mac,
+        rdId:     info.rdId || '',
         lastSeen: info.lastSeen || Date.now()
       };
     }
