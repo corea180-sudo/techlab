@@ -201,7 +201,7 @@ async function handleClientMessage(clientId, msg) {
       }
       break;
     }
-
+    case 'command_result': info.lastResult = { at: Date.now(), original: msg.original || '', result: msg.result }; break;   // 에이전트가 이미 보내던 답 — 종전에는 여기서 버려 「했는지 못 했는지」를 볼 수 없었다
     // ── 룸 에이전트 상태 보고 ──
     case 'agent_report':
       info.lastSeen = Date.now();
@@ -502,6 +502,7 @@ app.get('/agents', (req, res) => {
         ip:       info.ip,
         mac:      info.mac,
         rdId:     info.rdId || '',
+        lastResult: info.lastResult || null,
         lastSeen: info.lastSeen || Date.now()
       };
     }
