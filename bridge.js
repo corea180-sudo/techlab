@@ -93,8 +93,6 @@ let clientSeq = 0;
 wss.on('connection', (ws) => {
   const clientId = ++clientSeq;
   clients.set(clientId, { ws, type: 'unknown' });
-  ws.isAlive = true;                                   // ★2026-10-09 서버 쪽 생사 확인(아래 _reapTimer)
-  ws.on('pong', () => { ws.isAlive = true; });
   console.log(`[WS] 클라이언트 연결 #${clientId} (총 ${clients.size}명)`);
 
   // 연결 즉시 현재 상태 전송
@@ -129,45 +127,6 @@ wss.on('connection', (ws) => {
 });
 
 // ──────────────────────────────────────────
-// ★★2026-10-09 — 서버도 30초마다 상대의 생사를 잰다.
-//   종전에는 에이전트만 서버를 확인했고 서버는 상대를 확인하지 않았다. 깔끔하지 않게 끊긴(half-open) 연결이
-//   길게는 몇 시간 `clients` 에 남아, 그 매장이 「연결됨」으로 세어지고 명령이 죽은 연결로 갔다.
-//   ping 에 한 번(30~60초) 답이 없으면 끊는다 → close 처리(presence·5분 장애 판정)가 그대로 돈다.
-//   ws 라이브러리와 브라우저는 ping 에 스스로 답한다 — 클라이언트 코드 변경 0.
-const _reapTimer = setInterval(() => {
-  clients.forEach((info, id) => {
-    const w = info.ws;
-    if (!w) return;
-    if (w.isAlive === false) {
-      console.warn(`[WS] #${id} 응답 없음 — 끊는다 (${info.type}${info.roomId ? ' ' + info.roomId : ''})`);
-      try { w.terminate(); } catch (_) {}
-      return;
-    }
-    w.isAlive = false;
-    try { w.ping(); } catch (_) {}
-  });
-}, 30 * 1000);
-wss.on('close', () => clearInterval(_reapTimer));
-
-// 같은 에이전트(roomId)가 다시 붙으면 옛 연결을 닫는다 — 옛 연결이 남으면 명령이 그쪽으로 갔다.
-function _evictOlder(clientId, roomId) {
-  if (!roomId) return;
-  clients.forEach((o, id) => {
-    if (id !== clientId && o.type === 'room_agent' && o.roomId === roomId) {
-      console.warn(`[WS] #${id} ${roomId} 옛 연결 정리 (새 연결 #${clientId})`);
-      try { o.ws.terminate(); } catch (_) {}
-    }
-  });
-}
-// 명령은 살아 있는 가장 최근 연결로 보낸다
-function _liveAgent(roomId) {
-  let best = null, bestId = -1;
-  clients.forEach((o, id) => {
-    if (o.type === 'room_agent' && o.roomId === roomId && o.ws && o.ws.readyState === WebSocket.OPEN && id > bestId) { best = o; bestId = id; }
-  });
-  return best;
-}
-
 // 4. 클라이언트 메시지 처리
 // ──────────────────────────────────────────
 async function handleClientMessage(clientId, msg) {
@@ -205,7 +164,6 @@ async function handleClientMessage(clientId, msg) {
       }
       // 룸 에이전트 등록 시 Admin에 알림
       if (info.type === 'room_agent') {
-        _evictOlder(clientId, info.roomId);
         broadcast({ type: 'agent_online', roomId: info.roomId, hostname: msg.hostname, ip: msg.ip, mac: msg.mac }, 'admin');
       }
       break;
@@ -535,7 +493,7 @@ app.get('/agents', (req, res) => {
   const wantStore = req.query.storeId || null;   // ★매장별 필터 (하위호환: 파라미터 없으면 기존대로 전체)
   const result = {};
   clients.forEach((info, id) => {
-    if (info.type === 'room_agent' && info.roomId && info.ws && info.ws.readyState === WebSocket.OPEN) {
+    if (info.type === 'room_agent' && info.roomId) {
       if (wantStore && (info.storeId || null) !== wantStore) return;   // 그 매장 것만 반환
       result[info.roomId] = {
         clientId: id,
@@ -775,7 +733,7 @@ app.post('/rooms/set-all-ip', (req, res) => {
 // 특정 룸 에이전트 명령
 app.post('/agent/:roomId/command', (req, res) => {
   const { roomId } = req.params;
-  const target = _liveAgent(roomId);   // ★2026-10-09 — 종전 `.find` 는 가장 먼저 붙은(죽었을 수 있는) 연결을 골랐다
+  const target = [...clients.values()].find(c => c.type === 'room_agent' && c.roomId === roomId);
   if (!target) return res.status(404).json({ ok: false, error: '에이전트 오프라인' });
   target.ws.send(JSON.stringify(req.body));
   res.json({ ok: true });
