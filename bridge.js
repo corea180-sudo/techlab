@@ -93,6 +93,8 @@ let clientSeq = 0;
 wss.on('connection', (ws) => {
   const clientId = ++clientSeq;
   clients.set(clientId, { ws, type: 'unknown' });
+  ws.isAlive = true;                                   // ★2026-11-11 서버 쪽 생사 확인(아래 _reapTimer)
+  ws.on('pong', () => { ws.isAlive = true; });
   console.log(`[WS] 클라이언트 연결 #${clientId} (총 ${clients.size}명)`);
 
   // 연결 즉시 현재 상태 전송
@@ -125,6 +127,55 @@ wss.on('connection', (ws) => {
     console.log(`[WS] 클라이언트 해제 #${clientId} (총 ${clients.size}명)`);
   });
 });
+
+// ──────────────────────────────────────────
+// ★★2026-11-11 — 끊긴 옛 연결에 명령이 가던 것 (감곡 룸4 11-09 21:17 재부팅 뒤 80분 동안 명령 0건 도착 실측)
+//   ① 서버도 상대의 생사를 잰다 — ping 에 한 번(30~60초) 답이 없으면 끊는다 → close 처리(presence·5분 장애 판정)가 그대로 돈다.
+//      ws 라이브러리·브라우저는 ping 에 스스로 답한다(클라이언트 코드 변경 0).
+//   ② 같은 PC 가 다시 붙으면 그 PC 의 옛 연결만 닫는다 — 「같은 PC」 = 같은 매장 + 같은 MAC(MAC 이 없으면 같은 매장 + roomId + 호스트명).
+//   ③ 명령은 살아 있는 가장 최근 연결로(매장을 주면 그 매장 것만).
+//   ★10-09 판은 roomId 하나로 골라 다른 매장의 같은 번호 룸끼리 서로 끊어 냈다(그날 되돌림) — 매장을 넘어서는 고르지도 끊지도 않는다.
+const REAP_MS = Math.max(1000, parseInt(process.env.BRIDGE_REAP_MS || '30000', 10) || 30000);
+const _reapTimer = setInterval(() => {
+  clients.forEach((info, id) => {
+    const w = info.ws;
+    if (!w) return;
+    if (w.isAlive === false) {
+      console.warn(`[WS] #${id} 응답 없음 — 끊는다 (${info.type}${info.roomId ? ' ' + info.roomId : ''} [${info.storeId || '-'}])`);
+      try { w.terminate(); } catch (_) {}
+      return;
+    }
+    w.isAlive = false;
+    try { w.ping(); } catch (_) {}
+  });
+}, REAP_MS);
+wss.on('close', () => clearInterval(_reapTimer));
+function _samePc(a, b) {
+  if (!a || !b || (a.storeId || null) !== (b.storeId || null)) return false;
+  const ma = _normMac(a.mac), mb = _normMac(b.mac);
+  if (ma && mb) return ma === mb;
+  return !!a.roomId && a.roomId === b.roomId && String(a.hostname || '') === String(b.hostname || '');
+}
+function _evictOlder(clientId) {
+  const me = clients.get(clientId);
+  if (!me || me.type !== 'room_agent') return;
+  clients.forEach((o, id) => {
+    if (id < clientId && o.type === 'room_agent' && _samePc(o, me)) {
+      console.warn(`[WS] #${id} ${o.roomId || ''} [${o.storeId || '-'}] 같은 PC 의 옛 연결 정리 (새 연결 #${clientId})`);
+      try { o.ws.terminate(); } catch (_) {}
+    }
+  });
+}
+function _liveAgent(roomId, storeId) {
+  let best = null, bestId = -1;
+  clients.forEach((o, id) => {
+    if (o.type !== 'room_agent' || o.roomId !== roomId) return;
+    if (storeId && (o.storeId || null) !== storeId) return;
+    if (!o.ws || o.ws.readyState !== WebSocket.OPEN) return;
+    if (id > bestId) { best = o; bestId = id; }
+  });
+  return best;
+}
 
 // ──────────────────────────────────────────
 // 4. 클라이언트 메시지 처리
@@ -164,6 +215,7 @@ async function handleClientMessage(clientId, msg) {
       }
       // 룸 에이전트 등록 시 Admin에 알림
       if (info.type === 'room_agent') {
+        _evictOlder(clientId);
         broadcast({ type: 'agent_online', roomId: info.roomId, hostname: msg.hostname, ip: msg.ip, mac: msg.mac }, 'admin');
       }
       break;
@@ -218,7 +270,7 @@ async function handleClientMessage(clientId, msg) {
     // ── IP 설정 (Admin → Bridge → 룸 에이전트) ──
     case 'set_ip': {
       const { roomId, ip, subnet, gateway, dns } = msg;
-      const target = [...clients.values()].find(c => c.type === 'room_agent' && c.roomId === roomId);
+      const target = _liveAgent(roomId, info.storeId || null);   // ★2026-11-11 — 보낸 화면의 매장 것만 · 살아 있는 최근 연결
       if (target) {
         target.ws.send(JSON.stringify({ type: 'set_ip', ip, subnet, gateway, dns }));
       } else {
@@ -493,7 +545,7 @@ app.get('/agents', (req, res) => {
   const wantStore = req.query.storeId || null;   // ★매장별 필터 (하위호환: 파라미터 없으면 기존대로 전체)
   const result = {};
   clients.forEach((info, id) => {
-    if (info.type === 'room_agent' && info.roomId) {
+    if (info.type === 'room_agent' && info.roomId && info.ws && info.ws.readyState === WebSocket.OPEN) {   // ★2026-11-11 열린 연결만
       if (wantStore && (info.storeId || null) !== wantStore) return;   // 그 매장 것만 반환
       result[info.roomId] = {
         clientId: id,
@@ -733,7 +785,7 @@ app.post('/rooms/set-all-ip', (req, res) => {
 // 특정 룸 에이전트 명령
 app.post('/agent/:roomId/command', (req, res) => {
   const { roomId } = req.params;
-  const target = [...clients.values()].find(c => c.type === 'room_agent' && c.roomId === roomId);
+  const target = _liveAgent(roomId, req.query.storeId || null);   // ★2026-11-11 — 종전 `.find` 는 가장 먼저 붙은(끊겼을 수 있는) 연결을 골랐다
   if (!target) return res.status(404).json({ ok: false, error: '에이전트 오프라인' });
   target.ws.send(JSON.stringify(req.body));
   res.json({ ok: true });
