@@ -94,13 +94,15 @@ wss.on('connection', (ws) => {
   const clientId = ++clientSeq;
   clients.set(clientId, { ws, type: 'unknown' });
   ws.isAlive = true;                                   // ★2026-11-11 서버 쪽 생사 확인(아래 _reapTimer)
-  ws.on('pong', () => { ws.isAlive = true; });
+  ws.heardAt = Date.now();                             // ★2026-11-15 마지막으로 무엇이든 들은 때(pong · 메시지)
+  ws.on('pong', () => { ws.isAlive = true; ws.heardAt = Date.now(); });
   console.log(`[WS] 클라이언트 연결 #${clientId} (총 ${clients.size}명)`);
 
   // 연결 즉시 현재 상태 전송
   ws.send(JSON.stringify({ type: 'connected', clientId }));
 
   ws.on('message', async (raw) => {
+    ws.heardAt = Date.now();   // ★2026-11-15 — 무엇이든 받았으면 살아 있다(수문 룸7 윈7: 보고·명령 답은 오는데 pong 이 안 닿아 하루 41번 끊겼다)
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
     await handleClientMessage(clientId, msg);
@@ -140,7 +142,9 @@ const _reapTimer = setInterval(() => {
   clients.forEach((info, id) => {
     const w = info.ws;
     if (!w) return;
-    if (w.isAlive === false) {
+    /* ★2026-11-15 — pong 도 없고 **아무 말도 없이** 감시 두 바퀴가 지났을 때만 끊는다(반쯤 끊긴 연결은 그대로 1~1.5분 안에 끊긴다).
+       종전에는 pong 하나만 보아, 30초마다 보고를 보내며 명령에도 답하던 수문 룸7(윈7)을 4~5분마다 끊었다(관문 = 검사기-어드민:simbridgereap). */
+    if (w.isAlive === false && (Date.now() - (w.heardAt || 0)) > REAP_MS * 2) {
       console.warn(`[WS] #${id} 응답 없음 — 끊는다 (${info.type}${info.roomId ? ' ' + info.roomId : ''} [${info.storeId || '-'}])`);
       try { w.terminate(); } catch (_) {}
       return;
